@@ -1,0 +1,78 @@
+{
+  "id": "example_job_001",
+  "title_raw": "Senior Software Engineer",
+  "JobDescription": "We need strong Python skills.\n\nRequirements:\nExperience with AWS, Kubernetes, and Docker.\n\nEqual opportunity employer.",
+  "description_normalized": "We need strong Python skills.\n\nRequirements:\nExperience with AWS, Kubernetes, and Docker.\n\nEqual opportunity employer.",
+  "quality_assessment": {
+    "status": "complete",
+    "quality_score": 0.72,
+    "reasons": ["substantial length", "section-like structure"],
+    "features": {
+      "char_length": 120,
+      "non_empty_line_count": 5
+    }
+  },
+  "parsed_lines": [
+    {
+      "line_id": "Jexample_job_001_L0001",
+      "section": "body",
+      "text": "We need strong Python skills.",
+      "char_start": 0,
+      "char_end": 29,
+      "boilerplate_label": "skills_relevant",
+      "line_index": 0
+    }
+  ],
+  "skill_candidates": [
+    {
+      "candidate_text": "Python",
+      "line_id": "Jexample_job_001_L0001",
+      "char_start": 18,
+      "char_end": 24,
+      "rule_source": "strong_skills_pattern",
+      "section": "body",
+      "context_window": "We need strong Python skills."
+    }
+  ],
+  "skill_mentions": [
+    {
+      "mention_id": "Jexample_job_001_M00001",
+      "line_id": "Jexample_job_001_L0001",
+      "skill_span": "Python",
+      "normalized_candidate": "Python",
+      "is_skill": true,
+      "hard_soft": "hard",
+      "requirement_level": "required",
+      "char_start": 18,
+      "char_end": 24,
+      "evidence": "strong Python skills",
+      "raw_model_confidence": 0.92,
+      "final_confidence": 0.91,
+      "extractor_model": "qwen2.5:14b",
+      "rules_fired": ["strong_skills_pattern", "llm_extractor"],
+      "verifier_status": "skipped",
+      "verifier_model": "",
+      "verifier_confidence": 0.92,
+      "verifier_notes": "",
+      "created_at": "2026-02-09T12:00:00+00:00",
+      "run_id": "20260209_120000",
+      "section": "body",
+      "source_line": "We need strong Python skills.",
+      "support_count": 1,
+      "models_that_found_it": ["qwen2.5:14b"],
+      "model_disagreements": []
+    }
+  ],
+  "extraction_metadata": {
+    "run_id": "20260209_120000",
+    "pipeline_version": "2.0.0",
+    "extractor_model": "qwen2.5:14b",
+    "verifier_model": "mistral-nemo:12b",
+    "job_key": "Jexample_job_001",
+    "started_at": "2026-02-09T12:00:00+00:00",
+    "completed_at": "2026-02-09T12:00:05+00:00",
+    "extra": {
+      "job_title_snapshot": "Senior Software Engineer"
+    }
+  }
+}

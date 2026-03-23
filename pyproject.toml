@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skills-extraction"
+version = "2.0.2"
+description = "Open-vocabulary, line-level skill mention extraction from job postings (Ollama)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+skills-extraction = "skills_extraction.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["skills_extraction*"]

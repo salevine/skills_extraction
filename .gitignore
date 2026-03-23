@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+.env.local
+
+# Outputs
+skills_extraction_output/
+_skills_test_out/
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
