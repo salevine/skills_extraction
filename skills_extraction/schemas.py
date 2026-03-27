@@ -109,6 +109,15 @@ class SkillMention:
     verifier_notes: str
     created_at: str
     run_id: str
+    requirement_model: str = ""
+    requirement_status: str = "skipped"
+    requirement_confidence: Optional[float] = None
+    requirement_notes: str = ""
+    hardsoft_model: str = ""
+    hardsoft_status: str = "skipped"
+    hardsoft_confidence: Optional[float] = None
+    hardsoft_notes: str = ""
+    pipeline_audit: Dict[str, Any] = field(default_factory=dict)
     section: str = ""
     source_line: str = ""
     # Multi-model consensus not implemented; fields reserved / documented

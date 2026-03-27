@@ -5,6 +5,7 @@ Run statistics: LLM timing, job counts, mention counts — for logs and papers.
 from __future__ import annotations
 
 import json
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
@@ -19,11 +20,15 @@ class RunStats:
     pipeline_version: str
     extractor_model: str
     verifier_model: str
+    requirement_model: str
+    hardsoft_model: str
     fallback_model: str
     ollama_base_url: str
     skip_llm: bool
     batch_max_lines: int
     verifier_enabled: bool
+    requirement_classifier_enabled: bool
+    hardsoft_classifier_enabled: bool
 
     # Counters
     jobs_total: int = 0
@@ -34,6 +39,22 @@ class RunStats:
     # LLM timing: model -> (calls, total_seconds)
     _extractor_by_model: Dict[str, Dict[str, float]] = field(default_factory=lambda: defaultdict(lambda: {"calls": 0.0, "sec": 0.0}))
     _verifier_by_model: Dict[str, Dict[str, float]] = field(default_factory=lambda: defaultdict(lambda: {"calls": 0.0, "sec": 0.0}))
+
+    # Per-stage wall-clock timing
+    _stage_timing: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
+    def record_stage_start(self, stage: str) -> None:
+        """Record the start time for a pipeline stage."""
+        self._stage_timing[stage] = {
+            "started_at": time.perf_counter(),
+            "wall_sec": 0.0,
+        }
+
+    def record_stage_end(self, stage: str) -> None:
+        """Record the end time for a pipeline stage and compute duration."""
+        entry = self._stage_timing.get(stage)
+        if entry and "started_at" in entry:
+            entry["wall_sec"] = round(time.perf_counter() - entry["started_at"], 3)
 
     def record_llm(self, model: str, elapsed_sec: float, role: str = "extractor") -> None:
         """Record an LLM call. role is 'extractor' or 'verifier'."""
@@ -99,11 +120,15 @@ class RunStats:
             "config_snapshot": {
                 "extractor_model": self.extractor_model,
                 "verifier_model": self.verifier_model,
+                "requirement_model": self.requirement_model,
+                "hardsoft_model": self.hardsoft_model,
                 "fallback_model": self.fallback_model,
                 "ollama_base_url": self.ollama_base_url,
                 "skip_llm": self.skip_llm,
                 "batch_max_lines": self.batch_max_lines,
                 "verifier_enabled": self.verifier_enabled,
+                "requirement_classifier_enabled": self.requirement_classifier_enabled,
+                "hardsoft_classifier_enabled": self.hardsoft_classifier_enabled,
             },
             "llm_timing": {
                 "extractor": {
@@ -118,6 +143,10 @@ class RunStats:
                     "sec_per_call_avg": round(ver_total_sec / ver_total_calls, 3) if ver_total_calls > 0 else 0,
                     "by_model": verifier_detail,
                 },
+            },
+            "stage_timing": {
+                stage: {"wall_sec": info["wall_sec"]}
+                for stage, info in self._stage_timing.items()
             },
         }
 
@@ -161,6 +190,12 @@ class RunStats:
         ])
         for m in ver["by_model"]:
             lines.append(f"    {m['model']}: {m['calls']} calls, {m['total_sec']} sec, {m['sec_per_call_avg']} sec/call avg")
+
+        stage_t = d.get("stage_timing", {})
+        if stage_t:
+            lines.extend(["", "Stage timing:"])
+            for stage, info in stage_t.items():
+                lines.append(f"  {stage}: {info['wall_sec']}s")
 
         lines.append("")
         lines.append(json.dumps(d, indent=2))

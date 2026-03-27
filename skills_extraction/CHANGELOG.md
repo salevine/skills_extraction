@@ -5,6 +5,24 @@ This file is the canonical changelog for the skills-extraction project.
 
 ---
 
+## [3.0.0] — 2026-03-23 — Role-specialized staged pipeline + full audit trail
+
+- **Pipeline redesign:** Extraction now runs as explicit stages: **span extractor → skill verifier → requirement classifier → hard/soft classifier**.
+- **Role-specialized prompts:** Split prompt contracts by stage (candidate span detection, skill validity, requirement level, hard/soft class) for clearer responsibilities and lower prompt cross-talk.
+- **New stage modules:** Added `llm_requirement_classifier.py` and `llm_hardsoft_classifier.py` and integrated them into `pipeline.py`.
+- **Auditability (mention-level):** Each mention now includes `pipeline_audit` with per-stage `status`, `model`, and structured `output`/`error`, so failures are traceable to a specific stage.
+- **Auditability (job-level):** Added `pipeline_stage_audit` with stage counters (`*_parse_failed`, rejected mentions, stage errors) and model snapshot for the job.
+- **Schema extensions:** Added `requirement_*` and `hardsoft_*` fields to `SkillMention` (model, status, confidence, notes).
+- **Confidence update:** `compute_final_confidence` now blends requirement/hard-soft confidences (when available) and applies penalties for classifier parse failures or errors.
+- **Config/CLI expansion:** New config keys and CLI flags for stage models and toggles:
+  - Models: `requirement_model`, `hardsoft_model`
+  - Flags: `--requirement-model`, `--hardsoft-model`, `--no-requirement-classifier`, `--no-hardsoft-classifier`
+  - Env vars: `SKILLS_REQUIREMENT_MODEL`, `SKILLS_HARDSOFT_MODEL`
+- **Exports:** JSONL/CSV mention exports now include requirement/hard-soft stage statuses/models and serialized `pipeline_audit`.
+- **Versioning:** Pipeline/package version bumped to `3.0.0`.
+
+---
+
 ## [2.0.2] — 2026-03-23 — Precision / heuristics (review feedback)
 
 - **Candidate mining:** Gated `comma_list_token` to requirement sections or skill-cue lines; stricter tool-shaped tokens; large **stoplist** for generic nouns/verbs; replaced noisy bare `using|in` mining with **prep_phrase_strong** (head must be experience/knowledge/etc.).

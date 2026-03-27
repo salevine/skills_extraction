@@ -1,9 +1,9 @@
-# Skills extraction (v2) — full guide
+# Skills extraction (v3) — full guide
 
 Open-vocabulary, **line-level**, **audit-first** skill mention extraction using Ollama.  
 The **source of truth** is **mention-level** JSON (plus JSONL/CSV exports). Summary reports are **derived**, not primary.
 
-**Current release: 2.0.2** (see **`CHANGELOG.md`** for full history). Highlights: **tighter candidate mining** (gated comma-list / tool-shaped tokens / stoplist; strong prep phrases only); **inline section splitting** before line breaks; **conservative boilerplate** (`skills_relevant` only with lexical skill cues); **no company/location as fake description**; **verifier parse failures** → `parse_failed` + penalty + low-confidence queue; **smarter offset repair**; **`support_metadata`** / empty consensus fields until multi-model adjudication exists.
+**Current release: 3.0.0** (see **`CHANGELOG.md`** for full history). Highlights: **role-specialized staged pipeline** (span extraction → skill verifier → requirement classifier → hard/soft classifier), **mention-level `pipeline_audit`**, **job-level `pipeline_stage_audit`**, new classifier model/toggle CLI options, and confidence blending that includes secondary classifier outputs.
 
 ---
 
@@ -15,9 +15,9 @@ Job postings are messy. They mix real requirements with legal boilerplate, perks
 
 **Finding candidates before the LLM.** **Deterministic pattern mining** (experience / must-have / preferred / strong “skills” phrases, etc.) plus **gated** list-like tokens: comma-separated “tool-ish” candidates run mainly in **requirement-leaning sections** or lines that already look skill-related, with a **stoplist** for generic words. Goal: **enough recall** for real requirements without stuffing the prompt with narrative junk.
 
-**Where the large language model fits in.** The heavy lifting for *what counts as a skill* is done by an **Ollama-hosted** model in **batches of lines**, with the mined candidates and line context in the prompt. The design is deliberately **open vocabulary**: the model proposes spans and attributes (hard vs. soft requirement, uncertainty, etc.) rather than picking from a closed list. A **second, optional verifier** pass can double-check shaky cases—low confidence, muddy requirement level, odd boilerplate context—so you’re not relying on a single shot of model enthusiasm. If the verifier response **doesn’t parse**, the run records **`verifier_status=parse_failed`**, leaves **`verifier_confidence` null**, applies a **penalty** to final confidence, and includes the row in the **low-confidence** export (not a silent “accept”).
+**Where the large language model fits in.** The LLM flow is now **role-specialized by stage**. First, the extractor proposes candidate spans only (with evidence and `span_confidence`). Second, a skill verifier decides whether each span is truly a skill mention. Third and fourth stages classify accepted mentions as `required|optional|unclear` and `hard|soft|unknown`. This keeps each stage narrow, improves auditability, and makes failures easier to localize. Parse failures are recorded stage-by-stage (`parse_failed`) with penalties in final confidence and visibility in exports.
 
-**Confidence scores.** Each mention gets a final confidence between 0 and 1, blended from several signals—not just the model’s raw score. If a verifier ran **successfully**, the base combines extractor (45%) and verifier (55%). From there we add small boosts for *where* the mention appeared: a line in a “requirements” or “qualifications” section gets +0.06 or +0.05; “preferred”, “education”, “responsibilities” get smaller boosts. If one or more of the pattern rules (e.g. “experience with”, “must have”) also surfaced that span, we add up to +0.10. We subtract for red flags: −0.14 if the line looks like legal, benefits, or marketing boilerplate; −0.04 if it’s uncertain; −0.12 if the span’s character offsets don’t line up with the document; −0.06 if the quoted evidence isn’t actually a substring of the line (model drift or hallucination).
+**Confidence scores.** Each mention gets a final confidence between 0 and 1, blended from multiple stage outputs and deterministic checks. Extractor + verifier remain the base blend (when verifier output is valid), and requirement/hard-soft classifier confidences are incorporated as secondary signals. Section boosts, rule-support boosts, and penalties for boilerplate context, invalid offsets/evidence, and stage parse failures/errors still apply.
 
 *Example: high confidence.* A line reads “Required: 5+ years experience with Python and SQL.” The span “Python” appears in the “requirements” section, was mined by both the “experience with” and “must have” patterns, and the model returns it with 0.88. Boilerplate is “skills_relevant”, offsets are valid, evidence matches. Final score: 0.88 + 0.06 (section) + 0.05 (two rules) → **0.99**.
 
@@ -95,6 +95,8 @@ No fixed skill taxonomy or embedding service is required for the core pipeline.
 | `OLLAMA_URL` | Base or full generate URL; `/api/generate` stripped if present |
 | `SKILLS_EXTRACTOR_MODEL` | Default extractor model tag |
 | `SKILLS_VERIFIER_MODEL` | Default verifier model tag |
+| `SKILLS_REQUIREMENT_MODEL` | Default requirement classifier model tag |
+| `SKILLS_HARDSOFT_MODEL` | Default hard/soft classifier model tag |
 
 `.env.local` is loaded before `.env` (paths resolved from **repo root**, parent of `skills_extraction/`).
 
@@ -102,6 +104,8 @@ No fixed skill taxonomy or embedding service is required for the core pipeline.
 
 - Extractor: `qwen2.5:14b`
 - Verifier: `mistral-nemo:12b`
+- Requirement classifier: `mistral-nemo:12b`
+- Hard/soft classifier: `mistral-nemo:12b`
 - Fallback if extractor batch fails: `llama3.1:8b`
 - Remote Ollama default: `http://ollama.rs.gsu.edu` (override with `--local` → `http://localhost:11434`)
 
@@ -123,9 +127,13 @@ python -m skills_extraction [OPTIONS]
 | `--local` | Use local Ollama at `http://localhost:11434`. |
 | `--extractor-model` | Ollama model tag for extraction. |
 | `--verifier-model` | Ollama model tag for verification. |
+| `--requirement-model` | Ollama model tag for requirement classifier. |
+| `--hardsoft-model` | Ollama model tag for hard/soft classifier. |
 | `--fallback-model` | Used if a batch fails with the primary extractor. |
 | `--sample N` | Process only the first N jobs after load. |
 | `--no-verifier` | Disable the second LLM pass. |
+| `--no-requirement-classifier` | Disable requirement classifier pass. |
+| `--no-hardsoft-classifier` | Disable hard/soft classifier pass. |
 | `--skip-llm` | No Ollama calls: structure, `parsed_lines`, `skill_candidates`, quality only. |
 | `--no-reports` | Skip derived quality/frequency/low-confidence reports. |
 | `--batch-lines` | Max lines per extractor request (default `5`). |
@@ -147,10 +155,12 @@ python Runskills_extraction.py -i SampleJobs.json -o ./out --sample 10
 4. **Quality** — Multi-signal score + status; **missing description** → malformed (no company/location stand-in).
 5. **Boilerplate** — Per-line label; **conservative** promotion to `skills_relevant`.
 6. **Candidate mining** — Rule/pattern spans; **precision-tuned** list/prep rules (not line-wide noise).
-7. **LLM extractor** — Batched lines + candidates → JSON mentions; **offset repair** (valid model span → nearest match → evidence-aligned).
-8. **LLM verifier** — Optional; **parse failures** flagged explicitly.
-9. **Confidence** — Combine model, verifier (when valid), section, rules, boilerplate, offsets; penalties for `parse_failed` / errors.
-10. **Export** — Augmented JSON, JSONL, CSV, optional reports.
+7. **LLM span extractor** — Batched lines + candidates → candidate span mentions; **offset repair** (valid model span → nearest match → evidence-aligned).
+8. **LLM skill verifier** — Validates each candidate as skill/not-skill; parse failures flagged explicitly.
+9. **LLM requirement classifier** — Assigns `required|optional|unclear` for validated mentions.
+10. **LLM hard/soft classifier** — Assigns `hard|soft|unknown` for validated mentions.
+11. **Confidence** — Combine extractor/verifier/classifier confidence signals plus section/rule/boilerplate/offset checks.
+12. **Export** — Augmented JSON, JSONL, CSV, optional reports (with stage audit fields).
 
 Details live in the module table below and in source docstrings.
 
@@ -183,7 +193,8 @@ Original fields are **never removed**. New fields include:
 | `quality_assessment` | `status`, `quality_score`, `reasons`, `features`. |
 | `parsed_lines` | Line-level audit: `line_id`, `section`, `text`, offsets, `boilerplate_label`. |
 | `skill_candidates` | All mined spans (no early dedupe). |
-| `skill_mentions` | LLM output + verifier metadata; `verifier_status` may be `parse_failed`; `verifier_confidence` may be null; `support_metadata` notes single-pass extraction (consensus fields reserved). |
+| `skill_mentions` | Mention-level staged outputs (`verifier_*`, `requirement_*`, `hardsoft_*`) and per-mention `pipeline_audit` with per-stage status/model/output/error. |
+| `pipeline_stage_audit` | Job-level counters for stage failures/rejections and model snapshot for audit/debug. |
 | `extraction_metadata` | `run_id`, `pipeline_version`, models, timestamps, `job_key`. |
 
 **Example:** see `example_augmented_job_fragment.json` in this directory.
@@ -203,9 +214,11 @@ Original fields are **never removed**. New fields include:
 | `quality.py` | Document quality scoring |
 | `candidate_mining.py` | Pattern-based candidate spans |
 | `llm_ollama.py` | HTTP + JSON repair |
-| `prompts.py` | Extractor / verifier prompt text |
-| `llm_extractor.py` | Batched extraction |
-| `llm_verifier.py` | Second pass |
+| `prompts.py` | Stage-specific prompt text (extract/verify/classify) |
+| `llm_extractor.py` | Batched span extraction |
+| `llm_verifier.py` | Skill verifier stage |
+| `llm_requirement_classifier.py` | Requirement classifier stage |
+| `llm_hardsoft_classifier.py` | Hard/soft classifier stage |
 | `confidence.py` | Final confidence blending |
 | `exporters.py` | JSON / JSONL / CSV / reports |
 | `pipeline.py` | Orchestration |

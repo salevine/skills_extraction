@@ -54,8 +54,11 @@ def write_mentions_jsonl(path: Path, jobs: List[Dict[str, Any]]) -> None:
                     "final_confidence": m.get("final_confidence"),
                     "extractor_model": m.get("extractor_model"),
                     "verifier_status": m.get("verifier_status"),
+                    "requirement_status": m.get("requirement_status"),
+                    "hardsoft_status": m.get("hardsoft_status"),
                     "rules_fired": m.get("rules_fired"),
                     "is_skill": m.get("is_skill"),
+                    "pipeline_audit": m.get("pipeline_audit", {}),
                 }
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
     logger.info("Wrote JSONL: %s", path)
@@ -83,8 +86,13 @@ def write_mentions_csv(path: Path, jobs: List[Dict[str, Any]]) -> None:
         "extractor_model",
         "verifier_status",
         "verifier_model",
+        "requirement_status",
+        "requirement_model",
+        "hardsoft_status",
+        "hardsoft_model",
         "rules_fired",
         "is_skill",
+        "pipeline_audit",
     ]
     with path.open("w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
@@ -111,6 +119,7 @@ def write_mentions_csv(path: Path, jobs: List[Dict[str, Any]]) -> None:
                 r["job_id"] = job_id
                 r["title_raw"] = title
                 r["rules_fired"] = ";".join(m.get("rules_fired") or [])
+                r["pipeline_audit"] = json.dumps(m.get("pipeline_audit", {}), ensure_ascii=False)
                 w.writerow(r)
     logger.info("Wrote CSV: %s", path)
 

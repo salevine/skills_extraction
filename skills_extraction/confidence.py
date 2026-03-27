@@ -14,12 +14,16 @@ def rules_from_mention(rules_fired: List[str]) -> int:
 def compute_final_confidence(
     raw_model_confidence: float,
     verifier_confidence: Optional[float],
+    requirement_confidence: Optional[float],
+    hardsoft_confidence: Optional[float],
     section: str,
     rules_fired: List[str],
     boilerplate_label: str,
     offset_valid: bool,
     evidence_substring_of_line: bool,
     verifier_status: str = "skipped",
+    requirement_status: str = "skipped",
+    hardsoft_status: str = "skipped",
 ) -> float:
     s = float(raw_model_confidence)
     if verifier_status == "parse_failed":
@@ -29,6 +33,26 @@ def compute_final_confidence(
         s -= 0.12
     elif verifier_confidence is not None and verifier_status in ("accepted", "rejected"):
         s = 0.45 * s + 0.55 * float(verifier_confidence)
+
+    # Add secondary classifier signals for accepted mentions.
+    extra_conf_sum = 0.0
+    extra_conf_weight = 0.0
+    if requirement_confidence is not None and requirement_status in ("accepted", "completed"):
+        extra_conf_sum += float(requirement_confidence) * 0.5
+        extra_conf_weight += 0.5
+    if hardsoft_confidence is not None and hardsoft_status in ("accepted", "completed"):
+        extra_conf_sum += float(hardsoft_confidence) * 0.5
+        extra_conf_weight += 0.5
+    if extra_conf_weight > 0:
+        s = 0.7 * s + 0.3 * (extra_conf_sum / extra_conf_weight)
+    if requirement_status == "parse_failed":
+        s -= 0.08
+    elif requirement_status == "error":
+        s -= 0.06
+    if hardsoft_status == "parse_failed":
+        s -= 0.08
+    elif hardsoft_status == "error":
+        s -= 0.06
 
     sec_boost = {
         "requirements": 0.06,
@@ -63,6 +87,7 @@ def needs_verifier(
     verify_unclear_req: bool,
     verify_uncertain_bp: bool,
 ) -> bool:
+    # Retained for compatibility with older callers.
     if raw_confidence < verify_low_below:
         return True
     if verify_unknown_hs and hard_soft == "unknown":

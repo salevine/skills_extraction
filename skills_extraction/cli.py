@@ -71,22 +71,29 @@ Examples (run from repository root — the folder that contains `skills_extracti
   python -m skills_extraction -i jobs.json -o ./out --skip-llm
         """,
     )
-    parser.add_argument("--input", "-i", required=True, help="Input JSON (list of jobs or {jobs: [...]})")
+    parser.add_argument("--input", "-i", default=str(Path("../jobs/SampleJobs.json")), help="Input JSON (list of jobs or {jobs: [...]}); default: ../jobs/SampleJobs.json")
     parser.add_argument("--output-dir", "-o", default="skills_extraction_output", help="Directory for outputs")
     parser.add_argument("--run-id", default="", help="Run id (default: timestamp YYYYMMDD_HHMMSS)")
     parser.add_argument("--local", action="store_true", help="Use Ollama at http://localhost:11434")
     parser.add_argument("--extractor-model", default="", help="Override extractor model tag (default: qwen2.5:14b or env)")
     parser.add_argument("--verifier-model", default="", help="Override verifier model tag")
+    parser.add_argument("--requirement-model", default="", help="Override requirement classifier model tag")
+    parser.add_argument("--hardsoft-model", default="", help="Override hard/soft classifier model tag")
     parser.add_argument("--fallback-model", default="", help="Override fallback model if extractor fails")
     parser.add_argument("--sample", type=int, default=0, help="Process only first N jobs after load")
     parser.add_argument("--no-verifier", action="store_true", help="Disable verifier pass")
+    parser.add_argument("--no-requirement-classifier", action="store_true", help="Disable requirement classifier pass")
+    parser.add_argument("--no-hardsoft-classifier", action="store_true", help="Disable hard/soft classifier pass")
     parser.add_argument("--skip-llm", action="store_true", help="Skip Ollama (structure + candidates only)")
     parser.add_argument("--no-reports", action="store_true", help="Skip derived CSV summary reports")
+    parser.add_argument("--no-resume", action="store_true", help="Ignore existing checkpoints; overwrite from scratch")
     parser.add_argument("--batch-lines", type=int, default=5, help="Max lines per extractor LLM call")
     parser.add_argument("--context-size", type=int, default=32768, help="Ollama num_ctx")
     args = parser.parse_args()
 
-    run_id = args.run_id.strip() or generate_run_id()
+    ts = generate_run_id()
+    label = args.run_id.strip()
+    run_id = f"{label}_{ts}" if label else ts
     out_dir = Path(args.output_dir)
     log_file = out_dir / f"SkillsExtraction_pipeline_run_{run_id}.log"
     _configure_logging(log_file)
@@ -96,6 +103,8 @@ Examples (run from repository root — the folder that contains `skills_extracti
         "ollama_context_size": args.context_size,
         "extractor_batch_max_lines": max(1, args.batch_lines),
         "verifier_enabled": not args.no_verifier,
+        "requirement_classifier_enabled": not args.no_requirement_classifier,
+        "hardsoft_classifier_enabled": not args.no_hardsoft_classifier,
         "skip_llm": args.skip_llm,
     }
     if args.extractor_model:
@@ -104,6 +113,10 @@ Examples (run from repository root — the folder that contains `skills_extracti
         overrides["verifier_model"] = args.verifier_model
     if args.fallback_model:
         overrides["fallback_model"] = args.fallback_model
+    if args.requirement_model:
+        overrides["requirement_model"] = args.requirement_model
+    if args.hardsoft_model:
+        overrides["hardsoft_model"] = args.hardsoft_model
 
     cfg: PipelineConfig = load_config_from_env(overrides)
 
@@ -116,7 +129,16 @@ Examples (run from repository root — the folder that contains `skills_extracti
     print(f"Input: {src} ({len(jobs)} jobs)")
     print(f"Output dir: {out_dir.resolve()}")
     print(f"Ollama: {cfg.ollama_base_url}")
-    print(f"Extractor: {cfg.extractor_model} | Verifier: {cfg.verifier_model} | skip_llm={cfg.skip_llm}")
+    print(
+        "Extractor: "
+        f"{cfg.extractor_model} | "
+        f"Verifier: {cfg.verifier_model} | "
+        f"Req: {cfg.requirement_model} | "
+        f"HardSoft: {cfg.hardsoft_model} | "
+        f"skip_llm={cfg.skip_llm}"
+    )
+    print(f"Checkpoints: {(out_dir / 'checkpoints').resolve()}")
+    print(f"Resume: {not args.no_resume}")
     print(f"Log: {log_file}")
     print("=" * 70)
     print()
@@ -135,10 +157,16 @@ Examples (run from repository root — the folder that contains `skills_extracti
             eta = _format_eta(remaining_sec)
         else:
             eta = "..."
+        # Show stage name from extra if available
+        stage_label = ""
+        if isinstance(extra, dict):
+            stage_label = extra.get("stage", "")
+        if stage_label:
+            stage_label = f"{stage_label} | "
         bar_w = 20
         filled = int(bar_w * pct / 100)
         bar = "#" * filled + "-" * (bar_w - filled)
-        msg = f"  [{job_idx + 1:>{len(str(total))}}/{total}] [{bar}] {pct:5.1f}% | ETA ~{eta} | {detail_safe}"
+        msg = f"  [{job_idx + 1:>{len(str(total))}}/{total}] [{bar}] {pct:5.1f}% | ETA ~{eta} | {stage_label}{detail_safe}"
         try:
             print(f"\r{msg}", end="", flush=True)
         except UnicodeEncodeError:
@@ -153,6 +181,7 @@ Examples (run from repository root — the folder that contains `skills_extracti
         write_reports=not args.no_reports,
         progress_callback=_on_progress,
         log_path=log_file,
+        resume=not args.no_resume,
     )
     _configure_logging(log_file, quiet_console=False)
 

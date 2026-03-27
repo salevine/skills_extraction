@@ -154,6 +154,8 @@ def extract_mentions_for_batch(
             continue
 
         offset_valid = bool(span) and line_text[cs:ce] == span
+        if "span_confidence" not in m and "confidence" in m:
+            m["span_confidence"] = m.get("confidence")
         m["_glob_char_start"] = glob_cs
         m["_glob_char_end"] = glob_ce
         m["_line_char_start"] = cs

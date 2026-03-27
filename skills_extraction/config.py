@@ -39,8 +39,10 @@ class PipelineConfig:
     """Configurable knobs for the extraction pipeline."""
 
     # Models (Ollama tags)
-    extractor_model: str = "qwen2.5:14b"
+    extractor_model: str = "qwen3:14b"
     verifier_model: str = "mistral-nemo:12b"
+    requirement_model: str = "mistral-nemo:12b"
+    hardsoft_model: str = "mistral-nemo:12b"
     fallback_model: str = "llama3.1:8b"
 
     ollama_base_url: str = field(default_factory=lambda: resolve_ollama_base_url(False))
@@ -53,6 +55,8 @@ class PipelineConfig:
     # Line batching for LLM
     extractor_batch_max_lines: int = 5
     verifier_enabled: bool = True
+    requirement_classifier_enabled: bool = True
+    hardsoft_classifier_enabled: bool = True
 
     # Thresholds
     verifier_confidence_threshold: float = 0.72
@@ -65,7 +69,7 @@ class PipelineConfig:
     quality_complete_min_score: float = 0.45
 
     # Pipeline
-    pipeline_version: str = "2.0.2"
+    pipeline_version: str = "3.0.0"
     skip_llm: bool = False  # for tests: candidates only
 
     # Runtime timing: (model: str, elapsed_sec: float, role: "extractor"|"verifier") -> None
@@ -87,6 +91,10 @@ def load_config_from_env(overrides: Optional[Dict[str, Any]] = None) -> Pipeline
         cfg.extractor_model = os.getenv("SKILLS_EXTRACTOR_MODEL", cfg.extractor_model)
     if os.getenv("SKILLS_VERIFIER_MODEL"):
         cfg.verifier_model = os.getenv("SKILLS_VERIFIER_MODEL", cfg.verifier_model)
+    if os.getenv("SKILLS_REQUIREMENT_MODEL"):
+        cfg.requirement_model = os.getenv("SKILLS_REQUIREMENT_MODEL", cfg.requirement_model)
+    if os.getenv("SKILLS_HARDSOFT_MODEL"):
+        cfg.hardsoft_model = os.getenv("SKILLS_HARDSOFT_MODEL", cfg.hardsoft_model)
     if overrides:
         for k, v in overrides.items():
             if hasattr(cfg, k):
