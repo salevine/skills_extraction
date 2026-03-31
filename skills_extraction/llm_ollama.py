@@ -14,6 +14,12 @@ from .config import PipelineConfig
 
 logger = logging.getLogger(__name__)
 
+# Suppress noisy urllib3 connection-level debug logs
+logging.getLogger("urllib3.connectionpool").setLevel(logging.WARNING)
+
+# Persistent session for HTTP keep-alive (reuses TCP connections to Ollama)
+_session = requests.Session()
+
 
 def repair_json_text(text: str) -> str:
     t = text.strip()
@@ -59,7 +65,7 @@ def call_ollama(
     for attempt in range(cfg.ollama_max_retries):
         try:
             t0 = time.perf_counter()
-            r = requests.post(
+            r = _session.post(
                 cfg.generate_url(),
                 json=payload,
                 headers=cfg.ollama_headers(),

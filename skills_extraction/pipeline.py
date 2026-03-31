@@ -1304,6 +1304,7 @@ def run_pipeline(
         hardsoft_model=cfg.hardsoft_model,
         fallback_model=cfg.fallback_model,
         ollama_base_url=cfg.ollama_base_url,
+        backend=cfg.backend,
         skip_llm=cfg.skip_llm,
         batch_max_lines=cfg.extractor_batch_max_lines,
         verifier_enabled=cfg.verifier_enabled,

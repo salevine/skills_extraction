@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m skills_extraction:*)",
+      "Bash(powershell -Command:*)",
+      "Bash(python:*)",
+      "Bash(dir:*)",
+      "Bash(git status:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(curl:*)",
+      "WebSearch",
+      "Bash(findstr:*)"
+    ]
+  }
+}

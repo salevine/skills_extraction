@@ -52,6 +52,11 @@ class PipelineConfig:
     ollama_max_retries: int = 3
     per_call_delay_sec: float = 0.25
 
+    # Backend selection: "ollama" (default) or "openrouter"
+    backend: str = "ollama"
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    openrouter_max_tokens: int = 4096
+
     # Line batching for LLM
     extractor_batch_max_lines: int = 5
     verifier_enabled: bool = True
@@ -95,6 +100,10 @@ def load_config_from_env(overrides: Optional[Dict[str, Any]] = None) -> Pipeline
         cfg.requirement_model = os.getenv("SKILLS_REQUIREMENT_MODEL", cfg.requirement_model)
     if os.getenv("SKILLS_HARDSOFT_MODEL"):
         cfg.hardsoft_model = os.getenv("SKILLS_HARDSOFT_MODEL", cfg.hardsoft_model)
+    if os.getenv("SKILLS_BACKEND"):
+        cfg.backend = os.getenv("SKILLS_BACKEND").strip().lower()
+    if os.getenv("OPENROUTER_BASE_URL"):
+        cfg.openrouter_base_url = os.getenv("OPENROUTER_BASE_URL").strip()
     if overrides:
         for k, v in overrides.items():
             if hasattr(cfg, k):

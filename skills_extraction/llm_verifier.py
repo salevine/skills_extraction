@@ -7,7 +7,8 @@ import logging
 from typing import Any, Dict, Optional
 
 from .config import PipelineConfig
-from .llm_ollama import call_ollama, parse_json_loose
+from .llm_backend import call_llm
+from .llm_ollama import parse_json_loose
 from .prompts import SKILL_VERIFIER_SYSTEM, SKILL_VERIFIER_USER_TEMPLATE
 
 logger = logging.getLogger(__name__)
@@ -26,7 +27,7 @@ def verify_mention(
         line_text=line_text,
         mention_json=json.dumps(mention_dict, ensure_ascii=False),
     )
-    raw = call_ollama(cfg, model, SKILL_VERIFIER_SYSTEM, user, temperature=0.05, role="verifier")
+    raw = call_llm(cfg, model, SKILL_VERIFIER_SYSTEM, user, temperature=0.05, role="verifier")
     try:
         data = parse_json_loose(raw)
         if isinstance(data, dict):

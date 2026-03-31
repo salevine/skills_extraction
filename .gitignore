@@ -10,6 +10,7 @@ venv/
 # Outputs
 skills_extraction_output/
 _skills_test_out/
+test_*/
 *.log
 
 # IDE

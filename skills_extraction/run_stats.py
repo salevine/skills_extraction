@@ -24,6 +24,7 @@ class RunStats:
     hardsoft_model: str
     fallback_model: str
     ollama_base_url: str
+    backend: str
     skip_llm: bool
     batch_max_lines: int
     verifier_enabled: bool
@@ -124,6 +125,7 @@ class RunStats:
                 "hardsoft_model": self.hardsoft_model,
                 "fallback_model": self.fallback_model,
                 "ollama_base_url": self.ollama_base_url,
+                "backend": self.backend,
                 "skip_llm": self.skip_llm,
                 "batch_max_lines": self.batch_max_lines,
                 "verifier_enabled": self.verifier_enabled,

@@ -87,8 +87,10 @@ Examples (run from repository root — the folder that contains `skills_extracti
     parser.add_argument("--skip-llm", action="store_true", help="Skip Ollama (structure + candidates only)")
     parser.add_argument("--no-reports", action="store_true", help="Skip derived CSV summary reports")
     parser.add_argument("--no-resume", action="store_true", help="Ignore existing checkpoints; overwrite from scratch")
+    parser.add_argument("--backend", choices=["ollama", "openrouter"], default="", help="LLM backend (default: ollama, or SKILLS_BACKEND env)")
     parser.add_argument("--batch-lines", type=int, default=5, help="Max lines per extractor LLM call")
     parser.add_argument("--context-size", type=int, default=32768, help="Ollama num_ctx")
+    parser.add_argument("--timeout", type=int, default=300, help="Ollama HTTP timeout in seconds (default: 300)")
     args = parser.parse_args()
 
     ts = generate_run_id()
@@ -101,6 +103,7 @@ Examples (run from repository root — the folder that contains `skills_extracti
     overrides = {
         "ollama_base_url": resolve_ollama_base_url(use_local=args.local),
         "ollama_context_size": args.context_size,
+        "ollama_timeout_sec": args.timeout,
         "extractor_batch_max_lines": max(1, args.batch_lines),
         "verifier_enabled": not args.no_verifier,
         "requirement_classifier_enabled": not args.no_requirement_classifier,
@@ -117,6 +120,8 @@ Examples (run from repository root — the folder that contains `skills_extracti
         overrides["requirement_model"] = args.requirement_model
     if args.hardsoft_model:
         overrides["hardsoft_model"] = args.hardsoft_model
+    if args.backend:
+        overrides["backend"] = args.backend
 
     cfg: PipelineConfig = load_config_from_env(overrides)
 
@@ -128,7 +133,11 @@ Examples (run from repository root — the folder that contains `skills_extracti
     print(f"Skills extraction v2 | run_id={run_id}")
     print(f"Input: {src} ({len(jobs)} jobs)")
     print(f"Output dir: {out_dir.resolve()}")
-    print(f"Ollama: {cfg.ollama_base_url}")
+    print(f"Backend: {cfg.backend}")
+    if cfg.backend == "openrouter":
+        print(f"OpenRouter: {cfg.openrouter_base_url}")
+    else:
+        print(f"Ollama: {cfg.ollama_base_url}")
     print(
         "Extractor: "
         f"{cfg.extractor_model} | "

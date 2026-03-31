@@ -5,6 +5,22 @@ This file is the canonical changelog for the skills-extraction project.
 
 ---
 
+## [3.1.0] — 2026-03-27 — Stage-first execution with intermediate checkpoints
+
+- **Stage-first pipeline:** `run_pipeline()` now processes ALL jobs through each stage before advancing to the next, replacing the previous job-at-a-time loop. Stages execute in order: preprocess (0) → extract (1) → verify (2) → requirement classify (3) → hard/soft classify (4) → assemble (5).
+- **Model swap reduction:** Under the previous architecture, each job cycled through all four LLM stages, causing the Ollama server to swap between the extractor model (`qwen3:14b`) and the verifier/classifier model (`mistral-nemo:12b`) on every job — thousands of swaps for large corpora. The stage-first design reduces this to exactly one model transition per run (after extraction completes, the verifier model loads once and remains resident for stages 2–4). For a 10,000-job corpus, this eliminates an estimated 30,000+ model swap events.
+- **Intermediate checkpoints:** Each stage writes incremental JSONL checkpoint files under `output_dir/checkpoints/{run_id}_{stage}.jsonl`. Checkpoints use a header/footer protocol: a `_meta` line records run context, data lines are flushed on each record, and a `_complete` trailer marks successful stage completion. This enables crash-recovery resume without re-executing completed work.
+- **Resume-on-crash:** If a run is interrupted, restarting with the same `--run-id` automatically detects completed checkpoints (skips the stage entirely) and partial checkpoints (resumes from the last written record). The `--no-resume` flag forces a clean start.
+- **New module `checkpoint.py`:** Encapsulates checkpoint path resolution, completeness detection, record counting, JSONL read/write, and serialization helpers for `ParsedLine`, `CandidateSpan`, and mention dicts (including `_parsed_line` object ↔ `_parsed_line_dict` conversion).
+- **Per-stage timing:** `RunStats` now records wall-clock duration for each stage via `record_stage_start()`/`record_stage_end()`. Stage timing appears in both `run_summary.json` and the human-readable log block.
+- **Run ID collision prevention:** When `--run-id` is provided, the CLI now appends a timestamp (`{label}_{YYYYMMDD_HHMMSS}`), preventing checkpoint collisions across runs with the same label.
+- **HTTP connection pooling:** `llm_ollama.py` now uses a persistent `requests.Session` for all Ollama calls, eliminating per-call TCP connection setup. Estimated savings: ~0.3s per LLM call, or ~3–4 hours across a full 10,000-job extraction run.
+- **Log noise reduction:** `urllib3.connectionpool` debug logging suppressed to WARNING level; pipeline logs now contain only stage-level events.
+- **Progress display:** CLI progress bar now shows the current stage name (e.g., `stage1_extract | batch 3/6 for J15510`).
+- **Backward compatibility:** `process_single_job()` is retained with unchanged behavior for callers that process jobs individually outside `run_pipeline()`.
+
+---
+
 ## [3.0.0] — 2026-03-23 — Role-specialized staged pipeline + full audit trail
 
 - **Pipeline redesign:** Extraction now runs as explicit stages: **span extractor → skill verifier → requirement classifier → hard/soft classifier**.
