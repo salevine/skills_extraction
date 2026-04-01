@@ -89,6 +89,12 @@ Examples (run from repository root — the folder that contains `skills_extracti
     parser.add_argument("--no-resume", action="store_true", help="Ignore existing checkpoints; overwrite from scratch")
     parser.add_argument("--batch-lines", type=int, default=5, help="Max lines per extractor LLM call")
     parser.add_argument("--context-size", type=int, default=32768, help="Ollama num_ctx")
+
+    # vLLM backend options
+    parser.add_argument("--vllm", action="store_true", help="Use vLLM backend instead of Ollama")
+    parser.add_argument("--vllm-host", default="localhost", help="vLLM server hostname (default: localhost)")
+    parser.add_argument("--vllm-base-port", type=int, default=8001, help="vLLM first endpoint port (default: 8001)")
+    parser.add_argument("--vllm-num-endpoints", type=int, default=8, help="Number of vLLM endpoints (default: 8)")
     args = parser.parse_args()
 
     ts = generate_run_id()
@@ -118,6 +124,12 @@ Examples (run from repository root — the folder that contains `skills_extracti
     if args.hardsoft_model:
         overrides["hardsoft_model"] = args.hardsoft_model
 
+    if args.vllm:
+        overrides["llm_backend"] = "vllm"
+        overrides["vllm_host"] = args.vllm_host
+        overrides["vllm_base_port"] = args.vllm_base_port
+        overrides["vllm_num_endpoints"] = args.vllm_num_endpoints
+
     cfg: PipelineConfig = load_config_from_env(overrides)
 
     jobs, src = load_jobs_json(args.input)
@@ -128,7 +140,12 @@ Examples (run from repository root — the folder that contains `skills_extracti
     print(f"Skills extraction v2 | run_id={run_id}")
     print(f"Input: {src} ({len(jobs)} jobs)")
     print(f"Output dir: {out_dir.resolve()}")
-    print(f"Ollama: {cfg.ollama_base_url}")
+    if cfg.llm_backend == "vllm":
+        endpoints = cfg.vllm_endpoints()
+        print(f"Backend: vLLM ({len(endpoints)} endpoints)")
+        print(f"  {endpoints[0]} ... {endpoints[-1]}")
+    else:
+        print(f"Backend: Ollama @ {cfg.ollama_base_url}")
     print(
         "Extractor: "
         f"{cfg.extractor_model} | "

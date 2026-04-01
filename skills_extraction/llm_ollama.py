@@ -81,3 +81,19 @@ def call_ollama(
             logger.warning("Ollama attempt %s failed: %s", attempt + 1, e)
             time.sleep(1.5 * (attempt + 1))
     raise RuntimeError(f"Ollama failed after {cfg.ollama_max_retries} attempts: {last_err}")
+
+
+def call_llm(
+    cfg: PipelineConfig,
+    model: str,
+    system: str,
+    user: str,
+    temperature: float = 0.1,
+    role: str = "extractor",
+) -> str:
+    """Unified dispatcher: routes to Ollama or vLLM based on cfg.llm_backend."""
+    if cfg.llm_backend == "vllm":
+        from .llm_vllm import call_vllm
+
+        return call_vllm(cfg, model, system, user, temperature, role)
+    return call_ollama(cfg, model, system, user, temperature, role)
