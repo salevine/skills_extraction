@@ -17,6 +17,10 @@ def call_llm(
         from .llm_openrouter import call_openrouter
 
         return call_openrouter(cfg, model, system, user, temperature, role)
+    if cfg.backend == "vllm":
+        from .llm_vllm import call_vllm
+
+        return call_vllm(cfg, model, system, user, temperature, role)
     from .llm_ollama import call_ollama
 
     return call_ollama(cfg, model, system, user, temperature, role)

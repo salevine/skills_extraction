@@ -52,10 +52,17 @@ class PipelineConfig:
     ollama_max_retries: int = 3
     per_call_delay_sec: float = 0.25
 
-    # Backend selection: "ollama" (default) or "openrouter"
+    # Backend selection: "ollama" (default), "openrouter", or "vllm"
     backend: str = "ollama"
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_max_tokens: int = 4096
+
+    # vLLM settings (only used when backend="vllm")
+    vllm_host: str = "localhost"
+    vllm_base_port: int = 8001
+    vllm_num_endpoints: int = 8
+    vllm_max_retries: int = 3
+    vllm_timeout_sec: int = 300
 
     # Line batching for LLM
     extractor_batch_max_lines: int = 5
@@ -89,6 +96,13 @@ class PipelineConfig:
     def generate_url(self) -> str:
         return f"{self.ollama_base_url.rstrip('/')}/api/generate"
 
+
+    def vllm_endpoints(self) -> list:
+        """Generate vLLM endpoint URLs from host, base_port, and num_endpoints."""
+        return [
+            f"http://{self.vllm_host}:{self.vllm_base_port + i}/v1"
+            for i in range(self.vllm_num_endpoints)
+        ]
 
 def load_config_from_env(overrides: Optional[Dict[str, Any]] = None) -> PipelineConfig:
     cfg = PipelineConfig()
