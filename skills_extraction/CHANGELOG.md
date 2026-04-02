@@ -5,6 +5,40 @@ This file is the canonical changelog for the skills-extraction project.
 
 ---
 
+## [3.2.1] — 2026-04-02 — vLLM deadlock fix, thinking suppression, server deployment
+
+### Bug fix: Stage 1 vLLM deadlock
+
+- **Root cause:** The v3.2.0 windowed execution parallelized at the **job level** — each thread processed an entire job, which required multiple extractor batches (one per 5 lines). With 7 endpoints and 7 concurrent jobs, all threads would check out an endpoint for their first batch, then block indefinitely waiting for a second endpoint that would never become available. This caused a silent deadlock where the process appeared alive but made zero progress.
+- **Observed symptoms:** Stage 1 checkpoint file stayed at ~142 bytes (header only), no log output, no errors, GPU utilization at 0% on all cards. The process had to be killed externally.
+- **Fix:** Replaced job-level windowed parallelism with **batch-level parallelism**. All batches across all jobs are flattened into a single list, then processed in windows of N (= number of endpoints). Each batch in a window is assigned a **dedicated endpoint URL** via the new `call_vllm_direct()` function, completely bypassing the shared endpoint pool. Results are reassembled per-job after all batches complete, preserving checkpoint ordering.
+- **Why `call_vllm_direct()`:** The existing `call_vllm()` uses a module-level `queue.Queue` endpoint pool with blocking checkout. Even at the batch level, the pool's checkout/return cycle introduced contention under `ThreadPoolExecutor`. Direct endpoint assignment eliminates all shared state between threads.
+- **Stages 2–4 unaffected:** These stages process individual mentions (one LLM call per item), so the original `_run_windowed()` with the endpoint pool works correctly — each thread checks out one endpoint, makes one call, and returns it.
+- **Ollama/OpenRouter paths unchanged:** The sequential code path for non-vLLM backends was preserved exactly as-is.
+
+### vLLM thinking-mode suppression
+
+- **Problem:** Qwen3-14B on vLLM was generating extensive chain-of-thought reasoning (observed: ~400 reasoning tokens per call in the `reasoning_content` field) before producing the actual JSON output. This wasted GPU time and caused individual batches to take 30–80 seconds, with some hitting the 300-second timeout.
+- **Observed impact:** A 20-job sample with 86 batches across 7 GPUs estimated ~70 minutes; only 3 of 8 GPUs were active at any given time because slow batches blocked each window.
+- **Fix:** Added `"chat_template_kwargs": {"enable_thinking": false}` to the vLLM request payload in both `call_vllm_direct()` and `call_vllm()` when `cfg.disable_thinking` is `True` (which is the default). This is the vLLM equivalent of the Ollama `/no_think` suffix that was already in place since v3.2.0.
+- **Expected speedup:** 3–5x per batch, reducing per-window time from ~60s to ~10–15s.
+
+### Server deployment tooling
+
+- **`deploy.sh`:** Rsync-based deployment script that copies the project to `stacey@titan3.cs.gsu.edu:~/skills_extraction/` and the sample jobs to `~/jobs/SampleJobs.json`. Excludes `.venv`, `__pycache__`, `.git`, and output directories.
+- **`vLLM_run.sh`:** Server-side run script using `conda run -n skills` (avoids `conda init` requirement). Configured for 8 endpoints on ports 8000–8007 with `Qwen/Qwen3-14B` model name (matching the HuggingFace model ID that vLLM registers, not the Ollama tag format `qwen3:14b`).
+- **`test_vllm.sh`:** Endpoint health checker that curls all 8 ports and reports HTTP status codes.
+- **`test_simple.py`:** Minimal single-request test script for verifying vLLM chat/completions API connectivity.
+
+### Deployment lessons learned
+
+- **Model name mismatch:** vLLM registers models by HuggingFace ID (`Qwen/Qwen3-14B`), not Ollama-style tags (`qwen3:14b`). The `--extractor-model` flag must match exactly or all requests return 404.
+- **Port configuration:** The `--vllm-num-endpoints` and `--vllm-base-port` flags are only applied when using the `--vllm` CLI flag, not `--backend vllm`. The latter sets the backend but does not trigger the vLLM-specific argument overrides in the CLI.
+- **`conda run` buffering:** `conda run` buffers all stdout/stderr by default, making the pipeline appear to hang. The `--no-capture-output` flag is required to see real-time progress.
+- **Server has 8x NVIDIA RTX A6000 GPUs** (49 GB VRAM each), with vLLM workers on ports 8000–8007.
+
+---
+
 ## [3.2.0] — 2026-04-01 — Concurrent vLLM workers and multi-backend consolidation
 
 ### Multi-backend architecture
