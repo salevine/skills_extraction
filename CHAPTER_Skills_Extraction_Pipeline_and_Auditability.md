@@ -215,7 +215,107 @@ The stage-first architecture also enables per-stage wall-clock timing, which is 
 
 Run identifiers now include a mandatory timestamp component, even when a human-readable label is provided (for example, `full_10k_20260327_153936`). This prevents checkpoint collisions when the same label is reused across runs, which is important for iterative development and parameter sweeps.
 
-### X.13 Boundaries, Limitations, and Validity Notes
+### X.13 Operational Challenges During the 10,000-Posting Extraction
+
+The stage-first architecture described in Section X.12 was designed to make corpus-scale extraction operationally feasible. In practice, the first full-corpus run of 10,000 postings exposed several classes of infrastructure challenges that are relevant both to the engineering record and to the broader argument about extraction reproducibility.
+
+#### Server Stability and Transient Failures
+
+The extraction run against the university Ollama deployment spanned multiple days. During this period, the server intermittently returned HTTP 502 and 503 errors, typically correlated with periods of concurrent usage by other research groups. The pipeline's retry logic (up to three attempts per LLM call with exponential backoff) absorbed most of these transient failures, but sustained outage windows of 10–30 minutes occasionally triggered retry exhaustion. In these cases, the checkpoint-resume mechanism allowed the run to restart from the last persisted record without re-executing completed work.
+
+A separate class of failure involved zombie processes from prior interrupted runs writing concurrently to checkpoint files. When two processes target the same checkpoint path, the interleaved JSONL lines produce structurally invalid files that cannot be resumed. This was resolved operationally by enforcing single-writer access through timestamped run identifiers, but it highlighted a limitation of the file-based checkpoint design: it assumes exclusive access to the checkpoint directory for a given run.
+
+#### Throughput Characterization
+
+Per-call debug logging was added during the full run to characterize actual throughput. The Ollama server consistently delivered 107–114 tokens per second across both the extractor (`qwen3:14b`) and verifier/classifier (`mistral-nemo:12b`) models. However, wall-clock time per LLM call varied substantially: from 4.8 seconds for short verification calls to 81.6 seconds for large extraction batches. This variation reflects prompt length and generation length differences rather than server instability.
+
+The logged data confirmed that model inference time, not network or server overhead, was the dominant cost. This observation was important for infrastructure sizing: adding more concurrent connections to a single-GPU deployment would not improve throughput, because the GPU is the bottleneck. Meaningful acceleration requires distributing inference across multiple GPUs.
+
+#### Thinking-Mode Token Waste
+
+The Qwen3 model family supports an extended reasoning mode in which the model produces a `<think>...</think>` block before its answer. Per-call debug logging during the full extraction run revealed that this thinking output was not merely present but dominant. The `eval_count` field reported by the Ollama server — which counts all tokens generated, including those in `<think>` blocks that are stripped before the response is returned — consistently exceeded the visible response size by a factor of 2–7x. Representative examples from the production log illustrate the scale of the waste:
+
+| Wall clock | Response chars | Eval tokens (total generated) | Thinking overhead |
+|-----------|---------------|-------------------------------|-------------------|
+| 88.7s | 2,371 | 8,929 | 3.8x |
+| 87.5s | 1,474 | 8,823 | 6.0x |
+| 81.8s | 3,492 | 8,181 | 2.3x |
+| 58.4s | 803 | 5,959 | 7.4x |
+
+In the most extreme cases, the model generated nearly 9,000 tokens to produce a response containing fewer than 1,500 characters. At the observed throughput of 107–108 tok/s for these longer generations, the thinking tokens alone consumed 50–75 seconds of GPU time per call. For a span-extraction task where the model is asked to return structured JSON containing exact substrings, this intermediate reasoning provided no measurable improvement in extraction quality.
+
+The pipeline was updated to default to `disable_thinking=True`, which appends a `/no_think` suffix to suppress extended reasoning. This change was deployed mid-run at record 6,218 of 10,000 (approximately 62% through Stage 1 extraction) by stopping the running process and restarting it against the updated code. The checkpoint-resume mechanism allowed the restart to continue from the last persisted record with no data loss.
+
+The effect was immediately visible in the debug log. The first calls after the restart showed a fundamentally different token profile:
+
+| Wall clock | Response chars | Eval tokens (total generated) | Thinking overhead |
+|-----------|---------------|-------------------------------|-------------------|
+| 33.3s | 4,389 | 3,351 | 0.8x |
+| 26.6s | 3,787 | 2,697 | 0.7x |
+| 35.8s | 1,670 | 3,691 | 2.2x |
+
+With thinking suppressed via the prompt suffix, the eval token count dropped to approximately 1:1 with the response size in some cases, and wall-clock times fell from the 60–90 second range to 27–36 seconds. However, continued monitoring revealed that the prompt-level suppression was unreliable: approximately half of subsequent calls still exhibited 2–8x thinking overhead. The `/no_think` suffix is a soft instruction that Qwen3 follows on a per-turn basis; the model's dual-mode architecture can re-engage reasoning when prompt content triggers it, regardless of the suffix.
+
+This observation led to a second mid-run intervention. Ollama's API supports a runtime-level `think` parameter that controls thinking mode at the inference engine level rather than through prompt content. The pipeline's Ollama client was switched from the `/api/generate` endpoint to `/api/chat` with `"think": false` set in each request payload. This API-level control operates below the prompt layer and provides a deterministic guarantee that no thinking tokens are generated, rather than a probabilistic suppression.
+
+The effect was immediate and complete. After the second restart at record 6,226, every call showed eval token counts strictly proportional to response length at the expected tokenizer ratio (~0.3 tokens per character), with zero thinking overhead:
+
+| Wall clock | Response chars | Eval tokens (total generated) | Tokens/char ratio |
+|-----------|---------------|-------------------------------|-------------------|
+| 6.7s | 2,399 | 657 | 0.27 |
+| 9.6s | 3,222 | 968 | 0.30 |
+| 14.4s | 5,136 | 1,496 | 0.29 |
+| 5.9s | 1,978 | 584 | 0.30 |
+| 1.3s | 350 | 100 | 0.29 |
+
+Wall-clock times dropped from the original 60–90 second range to 1–15 seconds per call — a 5–10x reduction compared to the thinking-active baseline. The throughput in tokens per second actually increased slightly (from 107–110 to 113–117 tok/s), likely because shorter generations encounter less memory-bandwidth pressure.
+
+The progression across the three phases of the run — unconstrained thinking, prompt-level suppression, and API-level suppression — constitutes an unplanned but informative ablation. It demonstrates that for structured extraction tasks, extended reasoning provides no measurable benefit while imposing severe latency costs, and that the mechanism of suppression matters: prompt-level hints are insufficient, while API-level controls are effective.
+
+These mid-run interventions are themselves methodological artifacts worth noting. The fact that the pipeline could be stopped and restarted twice with configuration changes at the 62% and 62.3% marks, with checkpoint-based resume preserving all prior work each time, validates the crash-recovery design described in Section X.12. The `disable_thinking` setting is recorded in the configuration snapshot so that future runs can be compared explicitly. For all subsequent runs, API-level thinking suppression is the default.
+
+#### Infrastructure Sizing
+
+Based on the timing data from the full run, single-GPU extraction of the 10,000-posting corpus required approximately 4–5 days of continuous processing with thinking mode active (see log file `SkillsExtraction_pipeline_run_full_10k_20260327_185602.log`). The first mid-run deployment of prompt-level thinking suppression at the 62% mark reduced per-call latency by approximately 2x for a subset of calls. The second deployment of API-level suppression at the 62.3% mark reduced per-call latency by 5–10x uniformly. For a full run with API-level thinking suppression active from the start, the projected single-GPU timeline is approximately 18–24 hours — a 5–6x improvement over the thinking-active baseline.
+
+This timeline, while improved, would still be impractical for the refresh cycles envisioned in the dissertation's maintenance model. The timing breakdown confirmed that extraction (Stage 1) consumed the majority of wall-clock time, with verification and classification (Stages 2–4) collectively faster due to the lighter model and shorter prompts.
+
+These observations motivated the multi-GPU parallelism design described in Section X.14.
+
+### X.14 Multi-GPU Parallelism via vLLM
+
+#### Motivation
+
+The timing data from Section X.13 established that single-GPU extraction requires 4–5 days for the full corpus. For a system intended to support periodic refresh cycles, this timeline creates a practical constraint: each refresh run occupies the infrastructure for nearly a week, limiting the frequency and responsiveness of updates. Additionally, the 4.8–81.6 second variance in per-call wall-clock time suggested that a round-robin endpoint-selection strategy would be suboptimal, as fast endpoints would idle while waiting for slow calls to complete on other GPUs.
+
+#### Architecture: Endpoint Pool and Windowed Execution
+
+The multi-GPU design uses vLLM (a high-throughput LLM serving framework) deployed across 8 GPU endpoints, each exposing an OpenAI-compatible HTTP API on a distinct port. The pipeline communicates with these endpoints through a queue-based endpoint pool rather than round-robin selection.
+
+The endpoint pool uses a `queue.Queue` with checkout/return semantics. When a worker thread needs to make an LLM call, it checks out an endpoint from the pool (blocking if all are in use). After the call completes — whether successfully or with an error — the endpoint is returned to the pool before any retry backoff sleep, ensuring that endpoints are not held idle during wait periods. This design provides natural backpressure: if all 8 GPUs are saturated, additional work blocks at the queue rather than overloading endpoints.
+
+Execution uses a windowed concurrency model. Items are processed in windows of N (equal to the number of GPU endpoints). Within each window, all items are submitted concurrently to a thread pool, with each thread checking out its own endpoint from the queue. After all items in a window complete, the main thread sorts results by their original index and writes them to the checkpoint file in order. This preserves the checkpoint ordering guarantee required for crash recovery while enabling parallelism within each window.
+
+Progress callbacks fire from the main thread during the ordered-write phase, not from worker threads. This prevents interleaved stdout output during concurrent execution.
+
+#### Thread Safety
+
+Several design properties ensure thread safety without complex synchronization:
+
+- Each `call_vllm()` invocation uses a stateless `requests.post()` call with no shared HTTP session, eliminating connection-state races.
+- The pipeline configuration (`cfg`) is read-only during execution; no worker thread modifies shared configuration.
+- Checkpoint file handles are only accessed from the main thread during the ordered-write phase.
+- The `RunStats.record_llm()` method, which is invoked via the timing callback from worker threads, is protected by a `threading.Lock` to prevent counter corruption.
+
+#### Scope and Backend Independence
+
+The windowed execution path activates only when `cfg.backend == "vllm"`. The Ollama and OpenRouter backends retain their existing sequential execution paths with no code changes. This ensures that the concurrent design does not introduce regression risk for the primary Ollama-based workflow that produced the initial extraction results.
+
+#### Projected Performance
+
+With 8 GPU endpoints operating concurrently, the theoretical speedup is 8x, reducing the full-corpus extraction timeline from 4–5 days to approximately 12–18 hours. In practice, the speedup will be moderated by load imbalance within windows (the window completes only when its slowest item finishes) and by the sequential checkpoint-write overhead between windows. However, even a 5–6x realized speedup would reduce the extraction timeline to under 24 hours, making weekly refresh cycles operationally feasible.
+
+### X.15 Boundaries, Limitations, and Validity Notes
 
 Several limitations remain explicit.
 
@@ -223,9 +323,11 @@ First, extraction from free text is inherently uncertain. No stage decomposition
 
 Fourth, checkpoint-based resume assumes deterministic preprocessing. If input data or configuration changes between a crash and a restart under the same run identifier, the resumed stages may operate on inconsistent assumptions. The pipeline mitigates this by recording total record counts in checkpoint headers and refusing to resume when counts diverge, but it does not perform content-level validation of resumed state. For dissertation purposes, this is acceptable because runs are executed against fixed input snapshots.
 
+Fifth, the operational challenges documented in Section X.13 — transient server errors, checkpoint corruption from concurrent writers, and multi-day execution timelines — are not unique to this implementation. They reflect the general cost structure of running large-scale LLM inference against shared infrastructure. The multi-GPU parallelism described in Section X.14 addresses the throughput constraint but introduces its own trade-off: windowed execution can lose up to N items on crash (where N is the number of concurrent endpoints), compared to at most one item under sequential execution.
+
 These are accepted trade-offs in a dissertation context focused on explainable infrastructure for student-facing systems. The objective is not to maximize benchmark precision on a static corpus, but to create a refreshable process where outputs remain inspectable and governance remains feasible.
 
-### X.14 Implications for Dissertation Evaluation
+### X.16 Implications for Dissertation Evaluation
 
 The staged extraction architecture directly supports the evaluation logic defined elsewhere in this dissertation, particularly traceability-oriented analysis. For selected course-career pairs, alignment signals can be decomposed back to:
 
@@ -238,9 +340,9 @@ This decomposition is only possible because intermediate extraction artifacts ar
 
 In this sense, auditability is not an implementation convenience; it is part of the methodological argument of the dissertation.
 
-### X.15 Summary
+### X.17 Summary
 
-This chapter has described a role-specialized, open-vocabulary skill extraction pipeline designed for traceability, refreshability, and integration into a student-facing alignment framework. The key design decisions are explicit stage separation with retained audit artifacts at both mention and job levels, and stage-first execution scheduling with intermediate checkpoints to enable corpus-scale processing within feasible time budgets. Together, these enable practical calibration, transparent failure analysis, crash-recoverable execution, and reproducible refresh-cycle comparisons.
+This chapter has described a role-specialized, open-vocabulary skill extraction pipeline designed for traceability, refreshability, and integration into a student-facing alignment framework. The key design decisions are explicit stage separation with retained audit artifacts at both mention and job levels, stage-first execution scheduling with intermediate checkpoints to enable corpus-scale processing within feasible time budgets, and multi-GPU parallelism via windowed concurrent execution to reduce refresh-cycle timelines from days to hours. Together, these enable practical calibration, transparent failure analysis, crash-recoverable execution, and reproducible refresh-cycle comparisons.
 
 Within the scope of this dissertation, extraction quality is evaluated not only by what skills are found, but by whether those skills can be justified, reconstructed, and reviewed through preserved intermediate evidence. That standard is central to deploying machine-assisted alignment in educational contexts where interpretability is a requirement rather than a preference.
 

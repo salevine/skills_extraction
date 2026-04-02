@@ -1,4 +1,4 @@
-"""LLM dispatcher: routes calls to Ollama or OpenRouter based on cfg.backend."""
+"""LLM dispatcher: routes calls to Ollama, OpenRouter, or vLLM based on cfg.backend."""
 
 from __future__ import annotations
 

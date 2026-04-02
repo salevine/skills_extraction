@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -70,6 +71,308 @@ def _matching_rules(
         ):
             rules.append(c.rule_source)
     return list(dict.fromkeys(rules)) if rules else ["llm_extractor"]
+
+
+# ---------------------------------------------------------------------------
+# Windowed parallel execution helper (vLLM only)
+# ---------------------------------------------------------------------------
+
+def _run_windowed(
+    total: int,
+    start_idx: int,
+    window_size: int,
+    process_fn: Callable[[int], Dict[str, Any]],
+    progress_fn: Optional[Callable[[int, int], None]],
+    fh,
+    records: List[Dict[str, Any]],
+) -> None:
+    """
+    Process items in windows of *window_size* using a thread pool.
+
+    Within each window, all items are submitted concurrently. After the window
+    completes, results are sorted by original index and written to the
+    checkpoint file in order (main thread only). Progress callbacks also fire
+    from the main thread during the ordered-write phase.
+
+    Crash mid-window loses at most *window_size* items.
+    """
+    idx = start_idx
+    while idx < total:
+        window_end = min(idx + window_size, total)
+        futures = {}
+        with ThreadPoolExecutor(max_workers=window_size) as pool:
+            for i in range(idx, window_end):
+                futures[i] = pool.submit(process_fn, i)
+
+        # Collect results in original order
+        for i in range(idx, window_end):
+            record = futures[i].result()  # re-raises worker exceptions
+            append_checkpoint_record(fh, record)
+            records.append(record)
+            if progress_fn:
+                progress_fn(i, total)
+
+        idx = window_end
+
+
+# ---------------------------------------------------------------------------
+# Per-item processing functions for concurrent vLLM execution
+# ---------------------------------------------------------------------------
+
+def _process_extract_job(
+    idx: int,
+    stage0_data: List[Dict[str, Any]],
+    cfg: PipelineConfig,
+) -> Dict[str, Any]:
+    """Process a single job through Stage 1 extraction (thread-safe for vLLM)."""
+    s0 = stage0_data[idx]
+    job_key = s0["job_key"]
+    skip_llm = s0["skip_llm"]
+
+    extractor_model_used = cfg.extractor_model
+    raw_mentions: List[Dict[str, Any]] = []
+
+    if not skip_llm:
+        all_lines = [deserialize_parsed_line(d) for d in s0["parsed_lines"]]
+        llm_line_set = set(s0["llm_line_indices"])
+        llm_lines = [pl for pl in all_lines if pl.line_index in llm_line_set]
+        candidates = [deserialize_candidate(d) for d in s0["candidates"]]
+
+        if llm_lines:
+            batches = batch_lines(llm_lines, cfg.extractor_batch_max_lines)
+            for batch in batches:
+                try:
+                    part = extract_mentions_for_batch(
+                        cfg, batch, candidates, model=cfg.extractor_model
+                    )
+                    raw_mentions.extend(part)
+                except Exception as e:
+                    logger.warning("Extractor batch failed (%s), trying fallback", e)
+                    try:
+                        part = extract_mentions_for_batch(
+                            cfg, batch, candidates, model=cfg.fallback_model
+                        )
+                        extractor_model_used = cfg.fallback_model
+                        raw_mentions.extend(part)
+                    except Exception as e2:
+                        logger.error("Fallback extractor failed: %s", e2)
+
+    return {
+        "job_index": s0["job_index"],
+        "job_key": job_key,
+        "extractor_model_used": extractor_model_used,
+        "raw_mentions": [serialize_mention(m) for m in raw_mentions],
+    }
+
+
+def _process_verify_item(
+    mi: int,
+    mention_tasks: List[Tuple],
+    cfg: PipelineConfig,
+) -> Dict[str, Any]:
+    """Process a single mention through Stage 2 verification (thread-safe for vLLM)."""
+    job_index, job_key, mention_idx, m_dict, pl = mention_tasks[mi]
+
+    verifier_output: Dict[str, Any]
+    if not cfg.verifier_enabled:
+        verifier_output = {"status": "skipped"}
+    else:
+        span = m_dict.get("skill_span", "")
+        raw_conf = float(m_dict.get("span_confidence", m_dict.get("confidence", 0.7)))
+        evidence = str(m_dict.get("evidence", span))
+        mention_for_v = {
+            "skill_span": span,
+            "normalized_candidate": m_dict.get("normalized_candidate", span),
+            "span_confidence": raw_conf,
+            "evidence": evidence,
+            "line_id": pl.line_id,
+            "section": pl.section,
+        }
+        try:
+            vout = verify_mention(cfg, pl.section, pl.text, mention_for_v)
+            v_model = cfg.verifier_model
+            v_notes = str(vout.get("notes", ""))
+            if vout.get("_parse_failed"):
+                verifier_output = {
+                    "status": "parse_failed",
+                    "model": v_model,
+                    "is_skill": True,
+                    "confidence": None,
+                    "evidence": str(vout.get("evidence", evidence)),
+                    "notes": v_notes,
+                }
+            else:
+                is_skill = bool(vout.get("is_skill", True))
+                vc = vout.get("confidence")
+                if vc is None:
+                    v_conf = raw_conf
+                else:
+                    try:
+                        v_conf = float(vc)
+                    except (TypeError, ValueError):
+                        v_conf = raw_conf
+                verifier_output = {
+                    "status": "accepted" if is_skill else "rejected",
+                    "model": v_model,
+                    "is_skill": is_skill,
+                    "confidence": v_conf,
+                    "evidence": str(vout.get("evidence", evidence)),
+                    "notes": v_notes,
+                }
+        except Exception as e:
+            verifier_output = {
+                "status": "error",
+                "model": cfg.verifier_model,
+                "is_skill": True,
+                "confidence": None,
+                "evidence": "",
+                "notes": str(e)[:200],
+            }
+
+    return {
+        "job_index": job_index,
+        "job_key": job_key,
+        "mention_idx": mention_idx,
+        "verifier_output": verifier_output,
+    }
+
+
+def _process_requirement_item(
+    mi: int,
+    mention_tasks: List[Tuple],
+    stage2_lookup: Dict[Tuple, Dict[str, Any]],
+    cfg: PipelineConfig,
+) -> Dict[str, Any]:
+    """Process a single mention through Stage 3 requirement classification (thread-safe for vLLM)."""
+    job_index, job_key, mention_idx, m_dict, pl = mention_tasks[mi]
+    vout = stage2_lookup.get((job_index, mention_idx), {"status": "skipped"})
+    is_skill = _mention_is_skill(vout)
+
+    requirement_output: Dict[str, Any]
+    if not is_skill or not cfg.requirement_classifier_enabled:
+        requirement_output = {"status": "skipped"}
+    else:
+        span = m_dict.get("skill_span", "")
+        raw_conf = float(m_dict.get("span_confidence", m_dict.get("confidence", 0.7)))
+        v_conf = vout.get("confidence")
+        mention_for_c = {
+            "skill_span": span,
+            "normalized_candidate": m_dict.get("normalized_candidate", span),
+            "is_skill": is_skill,
+            "span_confidence": raw_conf,
+            "skill_verifier_confidence": v_conf,
+            "evidence": str(m_dict.get("evidence", span)),
+        }
+        try:
+            req_out = classify_requirement_level(cfg, pl.section, pl.text, mention_for_c)
+            req_model = cfg.requirement_model
+            req_notes = str(req_out.get("notes", ""))
+            if req_out.get("_parse_failed"):
+                requirement_output = {
+                    "status": "parse_failed",
+                    "model": req_model,
+                    "requirement_level": "unclear",
+                    "confidence": None,
+                    "evidence": str(req_out.get("evidence", "")),
+                    "notes": req_notes,
+                }
+            else:
+                req_lvl = str(req_out.get("requirement_level", "unclear")).lower()
+                rc = req_out.get("confidence")
+                req_conf = raw_conf if rc is None else float(rc)
+                requirement_output = {
+                    "status": "completed",
+                    "model": req_model,
+                    "requirement_level": req_lvl,
+                    "confidence": req_conf,
+                    "evidence": str(req_out.get("evidence", "")),
+                    "notes": req_notes,
+                }
+        except Exception as e:
+            requirement_output = {
+                "status": "error",
+                "model": cfg.requirement_model,
+                "requirement_level": "unclear",
+                "confidence": None,
+                "evidence": "",
+                "notes": str(e)[:200],
+            }
+
+    return {
+        "job_index": job_index,
+        "job_key": job_key,
+        "mention_idx": mention_idx,
+        "requirement_output": requirement_output,
+    }
+
+
+def _process_hardsoft_item(
+    mi: int,
+    mention_tasks: List[Tuple],
+    stage2_lookup: Dict[Tuple, Dict[str, Any]],
+    cfg: PipelineConfig,
+) -> Dict[str, Any]:
+    """Process a single mention through Stage 4 hard/soft classification (thread-safe for vLLM)."""
+    job_index, job_key, mention_idx, m_dict, pl = mention_tasks[mi]
+    vout = stage2_lookup.get((job_index, mention_idx), {"status": "skipped"})
+    is_skill = _mention_is_skill(vout)
+
+    hardsoft_output: Dict[str, Any]
+    if not is_skill or not cfg.hardsoft_classifier_enabled:
+        hardsoft_output = {"status": "skipped"}
+    else:
+        span = m_dict.get("skill_span", "")
+        raw_conf = float(m_dict.get("span_confidence", m_dict.get("confidence", 0.7)))
+        v_conf = vout.get("confidence")
+        mention_for_c = {
+            "skill_span": span,
+            "normalized_candidate": m_dict.get("normalized_candidate", span),
+            "is_skill": is_skill,
+            "span_confidence": raw_conf,
+            "skill_verifier_confidence": v_conf,
+            "evidence": str(m_dict.get("evidence", span)),
+        }
+        try:
+            hs_out = classify_hard_soft(cfg, pl.section, pl.text, mention_for_c)
+            hs_model = cfg.hardsoft_model
+            hs_notes = str(hs_out.get("notes", ""))
+            if hs_out.get("_parse_failed"):
+                hardsoft_output = {
+                    "status": "parse_failed",
+                    "model": hs_model,
+                    "hard_soft": "unknown",
+                    "confidence": None,
+                    "evidence": str(hs_out.get("evidence", "")),
+                    "notes": hs_notes,
+                }
+            else:
+                hard_soft = str(hs_out.get("hard_soft", "unknown")).lower()
+                hc = hs_out.get("confidence")
+                hs_conf = raw_conf if hc is None else float(hc)
+                hardsoft_output = {
+                    "status": "completed",
+                    "model": hs_model,
+                    "hard_soft": hard_soft,
+                    "confidence": hs_conf,
+                    "evidence": str(hs_out.get("evidence", "")),
+                    "notes": hs_notes,
+                }
+        except Exception as e:
+            hardsoft_output = {
+                "status": "error",
+                "model": cfg.hardsoft_model,
+                "hard_soft": "unknown",
+                "confidence": None,
+                "evidence": "",
+                "notes": str(e)[:200],
+            }
+
+    return {
+        "job_index": job_index,
+        "job_key": job_key,
+        "mention_idx": mention_idx,
+        "hardsoft_output": hardsoft_output,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -173,57 +476,73 @@ def _run_stage1_extract(
         if start_idx == 0:
             write_checkpoint_header(fh, run_id, "stage1_extracted", len(stage0_data))
 
-        for idx in range(start_idx, len(stage0_data)):
-            s0 = stage0_data[idx]
-            job_key = s0["job_key"]
-            skip_llm = s0["skip_llm"]
+        if cfg.backend == "vllm":
+            def _s1_progress(i: int, total: int) -> None:
+                if progress_cb:
+                    progress_cb(i, total, "stage1_extract",
+                                f"extracting {stage0_data[i]['job_key']}",
+                                {"stage": "stage1_extract"})
 
-            if progress_cb:
-                progress_cb(idx, len(stage0_data), "stage1_extract",
-                            f"extracting {job_key}",
-                            {"stage": "stage1_extract"})
+            _run_windowed(
+                total=len(stage0_data),
+                start_idx=start_idx,
+                window_size=cfg.vllm_num_endpoints,
+                process_fn=lambda idx: _process_extract_job(idx, stage0_data, cfg),
+                progress_fn=_s1_progress,
+                fh=fh,
+                records=records,
+            )
+        else:
+            for idx in range(start_idx, len(stage0_data)):
+                s0 = stage0_data[idx]
+                job_key = s0["job_key"]
+                skip_llm = s0["skip_llm"]
 
-            extractor_model_used = cfg.extractor_model
-            raw_mentions: List[Dict[str, Any]] = []
+                if progress_cb:
+                    progress_cb(idx, len(stage0_data), "stage1_extract",
+                                f"extracting {job_key}",
+                                {"stage": "stage1_extract"})
 
-            if not skip_llm:
-                # Reconstruct ParsedLine objects for LLM lines
-                all_lines = [deserialize_parsed_line(d) for d in s0["parsed_lines"]]
-                llm_line_set = set(s0["llm_line_indices"])
-                llm_lines = [pl for pl in all_lines if pl.line_index in llm_line_set]
-                candidates = [deserialize_candidate(d) for d in s0["candidates"]]
+                extractor_model_used = cfg.extractor_model
+                raw_mentions: List[Dict[str, Any]] = []
 
-                if llm_lines:
-                    batches = batch_lines(llm_lines, cfg.extractor_batch_max_lines)
-                    for batch_idx, batch in enumerate(batches):
-                        if progress_cb:
-                            progress_cb(idx, len(stage0_data), "stage1_extract",
-                                        f"batch {batch_idx+1}/{len(batches)} for {job_key}",
-                                        {"stage": "stage1_extract"})
-                        try:
-                            part = extract_mentions_for_batch(
-                                cfg, batch, candidates, model=cfg.extractor_model
-                            )
-                            raw_mentions.extend(part)
-                        except Exception as e:
-                            logger.warning("Extractor batch failed (%s), trying fallback", e)
+                if not skip_llm:
+                    all_lines = [deserialize_parsed_line(d) for d in s0["parsed_lines"]]
+                    llm_line_set = set(s0["llm_line_indices"])
+                    llm_lines = [pl for pl in all_lines if pl.line_index in llm_line_set]
+                    candidates = [deserialize_candidate(d) for d in s0["candidates"]]
+
+                    if llm_lines:
+                        batches = batch_lines(llm_lines, cfg.extractor_batch_max_lines)
+                        for batch_idx, batch in enumerate(batches):
+                            if progress_cb:
+                                progress_cb(idx, len(stage0_data), "stage1_extract",
+                                            f"batch {batch_idx+1}/{len(batches)} for {job_key}",
+                                            {"stage": "stage1_extract"})
                             try:
                                 part = extract_mentions_for_batch(
-                                    cfg, batch, candidates, model=cfg.fallback_model
+                                    cfg, batch, candidates, model=cfg.extractor_model
                                 )
-                                extractor_model_used = cfg.fallback_model
                                 raw_mentions.extend(part)
-                            except Exception as e2:
-                                logger.error("Fallback extractor failed: %s", e2)
+                            except Exception as e:
+                                logger.warning("Extractor batch failed (%s), trying fallback", e)
+                                try:
+                                    part = extract_mentions_for_batch(
+                                        cfg, batch, candidates, model=cfg.fallback_model
+                                    )
+                                    extractor_model_used = cfg.fallback_model
+                                    raw_mentions.extend(part)
+                                except Exception as e2:
+                                    logger.error("Fallback extractor failed: %s", e2)
 
-            record = {
-                "job_index": s0["job_index"],
-                "job_key": job_key,
-                "extractor_model_used": extractor_model_used,
-                "raw_mentions": [serialize_mention(m) for m in raw_mentions],
-            }
-            append_checkpoint_record(fh, record)
-            records.append(record)
+                record = {
+                    "job_index": s0["job_index"],
+                    "job_key": job_key,
+                    "extractor_model_used": extractor_model_used,
+                    "raw_mentions": [serialize_mention(m) for m in raw_mentions],
+                }
+                append_checkpoint_record(fh, record)
+                records.append(record)
 
         write_checkpoint_footer(fh, len(records))
     return records
@@ -260,78 +579,95 @@ def _run_stage2_verify(
         if start_idx == 0:
             write_checkpoint_header(fh, run_id, "stage2_verified", total_mentions)
 
-        for mi in range(start_idx, total_mentions):
-            job_index, job_key, mention_idx, m_dict, pl = mention_tasks[mi]
+        if cfg.backend == "vllm":
+            def _s2_progress(i: int, total: int) -> None:
+                if progress_cb:
+                    progress_cb(i, total, "stage2_verify",
+                                f"verifying mention {i+1}/{total}",
+                                {"stage": "stage2_verify"})
 
-            if progress_cb:
-                progress_cb(mi, total_mentions, "stage2_verify",
-                            f"verifying mention {mi+1}/{total_mentions}",
-                            {"stage": "stage2_verify"})
+            _run_windowed(
+                total=total_mentions,
+                start_idx=start_idx,
+                window_size=cfg.vllm_num_endpoints,
+                process_fn=lambda mi: _process_verify_item(mi, mention_tasks, cfg),
+                progress_fn=_s2_progress,
+                fh=fh,
+                records=records,
+            )
+        else:
+            for mi in range(start_idx, total_mentions):
+                job_index, job_key, mention_idx, m_dict, pl = mention_tasks[mi]
 
-            verifier_output: Dict[str, Any]
-            if not cfg.verifier_enabled:
-                verifier_output = {"status": "skipped"}
-            else:
-                span = m_dict.get("skill_span", "")
-                raw_conf = float(m_dict.get("span_confidence", m_dict.get("confidence", 0.7)))
-                evidence = str(m_dict.get("evidence", span))
-                mention_for_v = {
-                    "skill_span": span,
-                    "normalized_candidate": m_dict.get("normalized_candidate", span),
-                    "span_confidence": raw_conf,
-                    "evidence": evidence,
-                    "line_id": pl.line_id,
-                    "section": pl.section,
-                }
-                try:
-                    vout = verify_mention(cfg, pl.section, pl.text, mention_for_v)
-                    v_model = cfg.verifier_model
-                    v_notes = str(vout.get("notes", ""))
-                    if vout.get("_parse_failed"):
+                if progress_cb:
+                    progress_cb(mi, total_mentions, "stage2_verify",
+                                f"verifying mention {mi+1}/{total_mentions}",
+                                {"stage": "stage2_verify"})
+
+                verifier_output: Dict[str, Any]
+                if not cfg.verifier_enabled:
+                    verifier_output = {"status": "skipped"}
+                else:
+                    span = m_dict.get("skill_span", "")
+                    raw_conf = float(m_dict.get("span_confidence", m_dict.get("confidence", 0.7)))
+                    evidence = str(m_dict.get("evidence", span))
+                    mention_for_v = {
+                        "skill_span": span,
+                        "normalized_candidate": m_dict.get("normalized_candidate", span),
+                        "span_confidence": raw_conf,
+                        "evidence": evidence,
+                        "line_id": pl.line_id,
+                        "section": pl.section,
+                    }
+                    try:
+                        vout = verify_mention(cfg, pl.section, pl.text, mention_for_v)
+                        v_model = cfg.verifier_model
+                        v_notes = str(vout.get("notes", ""))
+                        if vout.get("_parse_failed"):
+                            verifier_output = {
+                                "status": "parse_failed",
+                                "model": v_model,
+                                "is_skill": True,
+                                "confidence": None,
+                                "evidence": str(vout.get("evidence", evidence)),
+                                "notes": v_notes,
+                            }
+                        else:
+                            is_skill = bool(vout.get("is_skill", True))
+                            vc = vout.get("confidence")
+                            if vc is None:
+                                v_conf = raw_conf
+                            else:
+                                try:
+                                    v_conf = float(vc)
+                                except (TypeError, ValueError):
+                                    v_conf = raw_conf
+                            verifier_output = {
+                                "status": "accepted" if is_skill else "rejected",
+                                "model": v_model,
+                                "is_skill": is_skill,
+                                "confidence": v_conf,
+                                "evidence": str(vout.get("evidence", evidence)),
+                                "notes": v_notes,
+                            }
+                    except Exception as e:
                         verifier_output = {
-                            "status": "parse_failed",
-                            "model": v_model,
+                            "status": "error",
+                            "model": cfg.verifier_model,
                             "is_skill": True,
                             "confidence": None,
-                            "evidence": str(vout.get("evidence", evidence)),
-                            "notes": v_notes,
+                            "evidence": "",
+                            "notes": str(e)[:200],
                         }
-                    else:
-                        is_skill = bool(vout.get("is_skill", True))
-                        vc = vout.get("confidence")
-                        if vc is None:
-                            v_conf = raw_conf
-                        else:
-                            try:
-                                v_conf = float(vc)
-                            except (TypeError, ValueError):
-                                v_conf = raw_conf
-                        verifier_output = {
-                            "status": "accepted" if is_skill else "rejected",
-                            "model": v_model,
-                            "is_skill": is_skill,
-                            "confidence": v_conf,
-                            "evidence": str(vout.get("evidence", evidence)),
-                            "notes": v_notes,
-                        }
-                except Exception as e:
-                    verifier_output = {
-                        "status": "error",
-                        "model": cfg.verifier_model,
-                        "is_skill": True,
-                        "confidence": None,
-                        "evidence": "",
-                        "notes": str(e)[:200],
-                    }
 
-            record = {
-                "job_index": job_index,
-                "job_key": job_key,
-                "mention_idx": mention_idx,
-                "verifier_output": verifier_output,
-            }
-            append_checkpoint_record(fh, record)
-            records.append(record)
+                record = {
+                    "job_index": job_index,
+                    "job_key": job_key,
+                    "mention_idx": mention_idx,
+                    "verifier_output": verifier_output,
+                }
+                append_checkpoint_record(fh, record)
+                records.append(record)
 
         write_checkpoint_footer(fh, len(records))
     return records
@@ -370,74 +706,91 @@ def _run_stage3_requirement(
         if start_idx == 0:
             write_checkpoint_header(fh, run_id, "stage3_requirement", total_mentions)
 
-        for mi in range(start_idx, total_mentions):
-            job_index, job_key, mention_idx, m_dict, pl = mention_tasks[mi]
-            vout = v_lookup.get((job_index, mention_idx), {"status": "skipped"})
-            is_skill = _mention_is_skill(vout)
+        if cfg.backend == "vllm":
+            def _s3_progress(i: int, total: int) -> None:
+                if progress_cb:
+                    progress_cb(i, total, "stage3_requirement",
+                                f"classifying requirement {i+1}/{total}",
+                                {"stage": "stage3_requirement"})
 
-            if progress_cb:
-                progress_cb(mi, total_mentions, "stage3_requirement",
-                            f"classifying requirement {mi+1}/{total_mentions}",
-                            {"stage": "stage3_requirement"})
+            _run_windowed(
+                total=total_mentions,
+                start_idx=start_idx,
+                window_size=cfg.vllm_num_endpoints,
+                process_fn=lambda mi: _process_requirement_item(mi, mention_tasks, v_lookup, cfg),
+                progress_fn=_s3_progress,
+                fh=fh,
+                records=records,
+            )
+        else:
+            for mi in range(start_idx, total_mentions):
+                job_index, job_key, mention_idx, m_dict, pl = mention_tasks[mi]
+                vout = v_lookup.get((job_index, mention_idx), {"status": "skipped"})
+                is_skill = _mention_is_skill(vout)
 
-            requirement_output: Dict[str, Any]
-            if not is_skill or not cfg.requirement_classifier_enabled:
-                requirement_output = {"status": "skipped"}
-            else:
-                span = m_dict.get("skill_span", "")
-                raw_conf = float(m_dict.get("span_confidence", m_dict.get("confidence", 0.7)))
-                v_conf = vout.get("confidence")
-                mention_for_c = {
-                    "skill_span": span,
-                    "normalized_candidate": m_dict.get("normalized_candidate", span),
-                    "is_skill": is_skill,
-                    "span_confidence": raw_conf,
-                    "skill_verifier_confidence": v_conf,
-                    "evidence": str(m_dict.get("evidence", span)),
-                }
-                try:
-                    req_out = classify_requirement_level(cfg, pl.section, pl.text, mention_for_c)
-                    req_model = cfg.requirement_model
-                    req_notes = str(req_out.get("notes", ""))
-                    if req_out.get("_parse_failed"):
+                if progress_cb:
+                    progress_cb(mi, total_mentions, "stage3_requirement",
+                                f"classifying requirement {mi+1}/{total_mentions}",
+                                {"stage": "stage3_requirement"})
+
+                requirement_output: Dict[str, Any]
+                if not is_skill or not cfg.requirement_classifier_enabled:
+                    requirement_output = {"status": "skipped"}
+                else:
+                    span = m_dict.get("skill_span", "")
+                    raw_conf = float(m_dict.get("span_confidence", m_dict.get("confidence", 0.7)))
+                    v_conf = vout.get("confidence")
+                    mention_for_c = {
+                        "skill_span": span,
+                        "normalized_candidate": m_dict.get("normalized_candidate", span),
+                        "is_skill": is_skill,
+                        "span_confidence": raw_conf,
+                        "skill_verifier_confidence": v_conf,
+                        "evidence": str(m_dict.get("evidence", span)),
+                    }
+                    try:
+                        req_out = classify_requirement_level(cfg, pl.section, pl.text, mention_for_c)
+                        req_model = cfg.requirement_model
+                        req_notes = str(req_out.get("notes", ""))
+                        if req_out.get("_parse_failed"):
+                            requirement_output = {
+                                "status": "parse_failed",
+                                "model": req_model,
+                                "requirement_level": "unclear",
+                                "confidence": None,
+                                "evidence": str(req_out.get("evidence", "")),
+                                "notes": req_notes,
+                            }
+                        else:
+                            req_lvl = str(req_out.get("requirement_level", "unclear")).lower()
+                            rc = req_out.get("confidence")
+                            req_conf = raw_conf if rc is None else float(rc)
+                            requirement_output = {
+                                "status": "completed",
+                                "model": req_model,
+                                "requirement_level": req_lvl,
+                                "confidence": req_conf,
+                                "evidence": str(req_out.get("evidence", "")),
+                                "notes": req_notes,
+                            }
+                    except Exception as e:
                         requirement_output = {
-                            "status": "parse_failed",
-                            "model": req_model,
+                            "status": "error",
+                            "model": cfg.requirement_model,
                             "requirement_level": "unclear",
                             "confidence": None,
-                            "evidence": str(req_out.get("evidence", "")),
-                            "notes": req_notes,
+                            "evidence": "",
+                            "notes": str(e)[:200],
                         }
-                    else:
-                        req_lvl = str(req_out.get("requirement_level", "unclear")).lower()
-                        rc = req_out.get("confidence")
-                        req_conf = raw_conf if rc is None else float(rc)
-                        requirement_output = {
-                            "status": "completed",
-                            "model": req_model,
-                            "requirement_level": req_lvl,
-                            "confidence": req_conf,
-                            "evidence": str(req_out.get("evidence", "")),
-                            "notes": req_notes,
-                        }
-                except Exception as e:
-                    requirement_output = {
-                        "status": "error",
-                        "model": cfg.requirement_model,
-                        "requirement_level": "unclear",
-                        "confidence": None,
-                        "evidence": "",
-                        "notes": str(e)[:200],
-                    }
 
-            record = {
-                "job_index": job_index,
-                "job_key": job_key,
-                "mention_idx": mention_idx,
-                "requirement_output": requirement_output,
-            }
-            append_checkpoint_record(fh, record)
-            records.append(record)
+                record = {
+                    "job_index": job_index,
+                    "job_key": job_key,
+                    "mention_idx": mention_idx,
+                    "requirement_output": requirement_output,
+                }
+                append_checkpoint_record(fh, record)
+                records.append(record)
 
         write_checkpoint_footer(fh, len(records))
     return records
@@ -475,74 +828,91 @@ def _run_stage4_hardsoft(
         if start_idx == 0:
             write_checkpoint_header(fh, run_id, "stage4_hardsoft", total_mentions)
 
-        for mi in range(start_idx, total_mentions):
-            job_index, job_key, mention_idx, m_dict, pl = mention_tasks[mi]
-            vout = v_lookup.get((job_index, mention_idx), {"status": "skipped"})
-            is_skill = _mention_is_skill(vout)
+        if cfg.backend == "vllm":
+            def _s4_progress(i: int, total: int) -> None:
+                if progress_cb:
+                    progress_cb(i, total, "stage4_hardsoft",
+                                f"classifying hard/soft {i+1}/{total}",
+                                {"stage": "stage4_hardsoft"})
 
-            if progress_cb:
-                progress_cb(mi, total_mentions, "stage4_hardsoft",
-                            f"classifying hard/soft {mi+1}/{total_mentions}",
-                            {"stage": "stage4_hardsoft"})
+            _run_windowed(
+                total=total_mentions,
+                start_idx=start_idx,
+                window_size=cfg.vllm_num_endpoints,
+                process_fn=lambda mi: _process_hardsoft_item(mi, mention_tasks, v_lookup, cfg),
+                progress_fn=_s4_progress,
+                fh=fh,
+                records=records,
+            )
+        else:
+            for mi in range(start_idx, total_mentions):
+                job_index, job_key, mention_idx, m_dict, pl = mention_tasks[mi]
+                vout = v_lookup.get((job_index, mention_idx), {"status": "skipped"})
+                is_skill = _mention_is_skill(vout)
 
-            hardsoft_output: Dict[str, Any]
-            if not is_skill or not cfg.hardsoft_classifier_enabled:
-                hardsoft_output = {"status": "skipped"}
-            else:
-                span = m_dict.get("skill_span", "")
-                raw_conf = float(m_dict.get("span_confidence", m_dict.get("confidence", 0.7)))
-                v_conf = vout.get("confidence")
-                mention_for_c = {
-                    "skill_span": span,
-                    "normalized_candidate": m_dict.get("normalized_candidate", span),
-                    "is_skill": is_skill,
-                    "span_confidence": raw_conf,
-                    "skill_verifier_confidence": v_conf,
-                    "evidence": str(m_dict.get("evidence", span)),
-                }
-                try:
-                    hs_out = classify_hard_soft(cfg, pl.section, pl.text, mention_for_c)
-                    hs_model = cfg.hardsoft_model
-                    hs_notes = str(hs_out.get("notes", ""))
-                    if hs_out.get("_parse_failed"):
+                if progress_cb:
+                    progress_cb(mi, total_mentions, "stage4_hardsoft",
+                                f"classifying hard/soft {mi+1}/{total_mentions}",
+                                {"stage": "stage4_hardsoft"})
+
+                hardsoft_output: Dict[str, Any]
+                if not is_skill or not cfg.hardsoft_classifier_enabled:
+                    hardsoft_output = {"status": "skipped"}
+                else:
+                    span = m_dict.get("skill_span", "")
+                    raw_conf = float(m_dict.get("span_confidence", m_dict.get("confidence", 0.7)))
+                    v_conf = vout.get("confidence")
+                    mention_for_c = {
+                        "skill_span": span,
+                        "normalized_candidate": m_dict.get("normalized_candidate", span),
+                        "is_skill": is_skill,
+                        "span_confidence": raw_conf,
+                        "skill_verifier_confidence": v_conf,
+                        "evidence": str(m_dict.get("evidence", span)),
+                    }
+                    try:
+                        hs_out = classify_hard_soft(cfg, pl.section, pl.text, mention_for_c)
+                        hs_model = cfg.hardsoft_model
+                        hs_notes = str(hs_out.get("notes", ""))
+                        if hs_out.get("_parse_failed"):
+                            hardsoft_output = {
+                                "status": "parse_failed",
+                                "model": hs_model,
+                                "hard_soft": "unknown",
+                                "confidence": None,
+                                "evidence": str(hs_out.get("evidence", "")),
+                                "notes": hs_notes,
+                            }
+                        else:
+                            hard_soft = str(hs_out.get("hard_soft", "unknown")).lower()
+                            hc = hs_out.get("confidence")
+                            hs_conf = raw_conf if hc is None else float(hc)
+                            hardsoft_output = {
+                                "status": "completed",
+                                "model": hs_model,
+                                "hard_soft": hard_soft,
+                                "confidence": hs_conf,
+                                "evidence": str(hs_out.get("evidence", "")),
+                                "notes": hs_notes,
+                            }
+                    except Exception as e:
                         hardsoft_output = {
-                            "status": "parse_failed",
-                            "model": hs_model,
+                            "status": "error",
+                            "model": cfg.hardsoft_model,
                             "hard_soft": "unknown",
                             "confidence": None,
-                            "evidence": str(hs_out.get("evidence", "")),
-                            "notes": hs_notes,
+                            "evidence": "",
+                            "notes": str(e)[:200],
                         }
-                    else:
-                        hard_soft = str(hs_out.get("hard_soft", "unknown")).lower()
-                        hc = hs_out.get("confidence")
-                        hs_conf = raw_conf if hc is None else float(hc)
-                        hardsoft_output = {
-                            "status": "completed",
-                            "model": hs_model,
-                            "hard_soft": hard_soft,
-                            "confidence": hs_conf,
-                            "evidence": str(hs_out.get("evidence", "")),
-                            "notes": hs_notes,
-                        }
-                except Exception as e:
-                    hardsoft_output = {
-                        "status": "error",
-                        "model": cfg.hardsoft_model,
-                        "hard_soft": "unknown",
-                        "confidence": None,
-                        "evidence": "",
-                        "notes": str(e)[:200],
-                    }
 
-            record = {
-                "job_index": job_index,
-                "job_key": job_key,
-                "mention_idx": mention_idx,
-                "hardsoft_output": hardsoft_output,
-            }
-            append_checkpoint_record(fh, record)
-            records.append(record)
+                record = {
+                    "job_index": job_index,
+                    "job_key": job_key,
+                    "mention_idx": mention_idx,
+                    "hardsoft_output": hardsoft_output,
+                }
+                append_checkpoint_record(fh, record)
+                records.append(record)
 
         write_checkpoint_footer(fh, len(records))
     return records

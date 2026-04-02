@@ -81,8 +81,9 @@ class PipelineConfig:
     quality_complete_min_score: float = 0.45
 
     # Pipeline
-    pipeline_version: str = "3.0.0"
+    pipeline_version: str = "3.2.0"
     skip_llm: bool = False  # for tests: candidates only
+    disable_thinking: bool = True  # append /no_think to suppress qwen3 thinking mode
 
     # Runtime timing: (model: str, elapsed_sec: float, role: "extractor"|"verifier") -> None
     llm_timing_callback: Optional[Callable[[str, float, str], None]] = None

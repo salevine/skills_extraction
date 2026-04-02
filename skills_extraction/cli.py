@@ -87,7 +87,7 @@ Examples (run from repository root — the folder that contains `skills_extracti
     parser.add_argument("--skip-llm", action="store_true", help="Skip Ollama (structure + candidates only)")
     parser.add_argument("--no-reports", action="store_true", help="Skip derived CSV summary reports")
     parser.add_argument("--no-resume", action="store_true", help="Ignore existing checkpoints; overwrite from scratch")
-    parser.add_argument("--backend", choices=["ollama", "openrouter"], default="", help="LLM backend (default: ollama, or SKILLS_BACKEND env)")
+    parser.add_argument("--backend", choices=["ollama", "openrouter", "vllm"], default="", help="LLM backend (default: ollama, or SKILLS_BACKEND env)")
     parser.add_argument("--batch-lines", type=int, default=5, help="Max lines per extractor LLM call")
     parser.add_argument("--context-size", type=int, default=32768, help="Ollama num_ctx")
     parser.add_argument("--timeout", type=int, default=300, help="Ollama HTTP timeout in seconds (default: 300)")
@@ -99,9 +99,13 @@ Examples (run from repository root — the folder that contains `skills_extracti
     parser.add_argument("--vllm-num-endpoints", type=int, default=8, help="Number of vLLM endpoints (default: 8)")
     args = parser.parse_args()
 
-    ts = generate_run_id()
     label = args.run_id.strip()
-    run_id = f"{label}_{ts}" if label else ts
+    if label and not args.no_resume:
+        # When resuming with an explicit run-id, use it as-is so checkpoints match
+        run_id = label
+    else:
+        ts = generate_run_id()
+        run_id = f"{label}_{ts}" if label else ts
     out_dir = Path(args.output_dir)
     log_file = out_dir / f"SkillsExtraction_pipeline_run_{run_id}.log"
     _configure_logging(log_file)

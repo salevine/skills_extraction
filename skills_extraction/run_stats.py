@@ -5,6 +5,7 @@ Run statistics: LLM timing, job counts, mention counts — for logs and papers.
 from __future__ import annotations
 
 import json
+import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -44,6 +45,9 @@ class RunStats:
     # Per-stage wall-clock timing
     _stage_timing: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
+    # Thread-safety for concurrent vLLM workers
+    _stats_lock: threading.Lock = field(default_factory=threading.Lock)
+
     def record_stage_start(self, stage: str) -> None:
         """Record the start time for a pipeline stage."""
         self._stage_timing[stage] = {
@@ -59,12 +63,13 @@ class RunStats:
 
     def record_llm(self, model: str, elapsed_sec: float, role: str = "extractor") -> None:
         """Record an LLM call. role is 'extractor' or 'verifier'."""
-        if role == "extractor":
-            self._extractor_by_model[model]["calls"] += 1
-            self._extractor_by_model[model]["sec"] += elapsed_sec
-        else:
-            self._verifier_by_model[model]["calls"] += 1
-            self._verifier_by_model[model]["sec"] += elapsed_sec
+        with self._stats_lock:
+            if role == "extractor":
+                self._extractor_by_model[model]["calls"] += 1
+                self._extractor_by_model[model]["sec"] += elapsed_sec
+            else:
+                self._verifier_by_model[model]["calls"] += 1
+                self._verifier_by_model[model]["sec"] += elapsed_sec
 
     def to_dict(self) -> Dict[str, Any]:
         completed = ""

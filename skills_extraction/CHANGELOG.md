@@ -5,6 +5,36 @@ This file is the canonical changelog for the skills-extraction project.
 
 ---
 
+## [3.2.0] — 2026-04-01 — Concurrent vLLM workers and multi-backend consolidation
+
+### Multi-backend architecture
+
+- **vLLM backend:** Added `llm_vllm.py` providing an OpenAI-compatible HTTP client for multi-GPU vLLM deployments. Endpoints are configured via `--vllm-host`, `--vllm-base-port`, and `--vllm-num-endpoints`; default is 8 endpoints on ports 8001–8008.
+- **OpenRouter backend:** Added `llm_openrouter.py` for cloud-hosted model inference via the OpenRouter API. Configured via `OPENROUTER_API_KEY` env var.
+- **Unified dispatcher:** `llm_backend.py` routes LLM calls to Ollama, vLLM, or OpenRouter based on `--backend` / `SKILLS_BACKEND`. All three share the same call signature (`cfg, model, system, user, temperature, role`), so pipeline stages are backend-agnostic.
+
+### Concurrent vLLM workers
+
+- **Endpoint pool:** Replaced `itertools.cycle` round-robin with a `queue.Queue` checkout/return pattern in `llm_vllm.py`. Endpoints are checked out before each request and returned immediately after completion (or failure, before retry sleep). This provides natural backpressure: if all 8 GPUs are busy, additional requests block until one becomes available, rather than blindly dispatching to an overloaded endpoint. Round-robin was insufficient because response times varied from 4.8s to 81.6s per batch during testing, meaning fast GPUs would idle while waiting for the cycle to return to them.
+- **Windowed parallel execution:** Added `_run_windowed()` helper in `pipeline.py` that processes items in windows of N (= `vllm_num_endpoints`) using `ThreadPoolExecutor`. Within each window, all items are submitted concurrently to different GPU endpoints. After the window completes, results are sorted by original index and checkpoints are written in order from the main thread. This preserves checkpoint ordering guarantees while enabling parallelism. Crash mid-window loses at most N items.
+- **Per-item processing functions:** Extracted `_process_extract_job()`, `_process_verify_item()`, `_process_requirement_item()`, and `_process_hardsoft_item()` as standalone functions suitable for concurrent execution. Each is stateless with respect to shared mutable state.
+- **Thread-safe statistics:** Added `_stats_lock: threading.Lock` to `RunStats` and wrapped `record_llm()` in a lock, since the timing callback is invoked from worker threads during concurrent vLLM execution.
+- **Backend-conditional branching:** Stages 1–4 now check `cfg.backend == "vllm"` and use windowed execution when true; Ollama and OpenRouter paths remain fully sequential and unchanged.
+- **Progress callbacks:** Fire from the main thread during the ordered checkpoint-write phase, not from worker threads, preventing stdout interleaving.
+
+### Operational hardening
+
+- **Debug logging:** Added per-call tok/s logging in the vLLM client for throughput monitoring during multi-day extractions.
+- **Thinking-mode suppression:** `disable_thinking` defaults to `True`, appending `/no_think` to Qwen3 prompts. This eliminates the extended reasoning output that was observed to waste 2–4x tokens per call without improving extraction quality.
+- **Timeout flag:** `--timeout` CLI flag for configurable HTTP timeout (default 300s), addressing 502/503 errors during sustained multi-hour runs.
+- **Run-ID resume fix:** Fixed run-id collision when resuming with the same label by appending timestamps to provided labels.
+
+### Versioning
+
+- Pipeline version bumped to `3.2.0`.
+
+---
+
 ## [3.1.0] — 2026-03-27 — Stage-first execution with intermediate checkpoints
 
 - **Stage-first pipeline:** `run_pipeline()` now processes ALL jobs through each stage before advancing to the next, replacing the previous job-at-a-time loop. Stages execute in order: preprocess (0) → extract (1) → verify (2) → requirement classify (3) → hard/soft classify (4) → assemble (5).
