@@ -13,6 +13,9 @@ _skills_test_out/
 test_*/
 *.log
 
+# Docs
+CHAPTER_Skills_Extraction_Pipeline_and_Auditability.md
+
 # IDE
 .idea/
 .vscode/
