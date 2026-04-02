@@ -12,6 +12,7 @@ from .candidate_mining import CandidateSpan
 from .config import PipelineConfig
 from .llm_backend import call_llm
 from .llm_ollama import parse_json_loose
+from .llm_vllm import call_vllm_direct
 from .prompts import EXTRACTOR_SYSTEM, EXTRACTOR_USER_TEMPLATE
 from .schemas import ParsedLine
 
@@ -84,7 +85,10 @@ def extract_mentions_for_batch(
     batch_lines: List[ParsedLine],
     candidates: List[CandidateSpan],
     model: Optional[str] = None,
+    endpoint: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
+    """Extract mentions from a batch of lines. If endpoint is provided, call
+    that vLLM endpoint directly (bypassing the shared endpoint pool)."""
     model = model or cfg.extractor_model
     cmap: Dict[str, List[CandidateSpan]] = {}
     for c in candidates:
@@ -118,7 +122,10 @@ def extract_mentions_for_batch(
         lines_json=json.dumps(lines_payload, ensure_ascii=False),
     )
 
-    raw = call_llm(cfg, model, EXTRACTOR_SYSTEM, user, temperature=0.1)
+    if endpoint:
+        raw = call_vllm_direct(cfg, endpoint, model, EXTRACTOR_SYSTEM, user, temperature=0.1)
+    else:
+        raw = call_llm(cfg, model, EXTRACTOR_SYSTEM, user, temperature=0.1)
     try:
         data = parse_json_loose(raw)
     except Exception as e:

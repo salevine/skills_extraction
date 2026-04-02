@@ -477,21 +477,67 @@ def _run_stage1_extract(
             write_checkpoint_header(fh, run_id, "stage1_extracted", len(stage0_data))
 
         if cfg.backend == "vllm":
-            def _s1_progress(i: int, total: int) -> None:
-                if progress_cb:
-                    progress_cb(i, total, "stage1_extract",
-                                f"extracting {stage0_data[i]['job_key']}",
-                                {"stage": "stage1_extract"})
+            # vLLM parallel: process batches across all jobs concurrently.
+            # We flatten all batches first, run them in parallel windows,
+            # then reassemble results per job. This avoids the deadlock that
+            # occurs when parallelizing at the job level (each job needs
+            # multiple batches, each checking out an endpoint).
+            job_batches = []  # list of (job_idx, batch, candidates)
+            job_meta = {}     # job_idx -> (job_key, skip_llm)
+            for idx in range(start_idx, len(stage0_data)):
+                s0 = stage0_data[idx]
+                job_meta[idx] = (s0["job_key"], s0["skip_llm"])
+                if not s0["skip_llm"]:
+                    all_lines = [deserialize_parsed_line(d) for d in s0["parsed_lines"]]
+                    llm_line_set = set(s0["llm_line_indices"])
+                    llm_lines = [pl for pl in all_lines if pl.line_index in llm_line_set]
+                    cands = [deserialize_candidate(d) for d in s0["candidates"]]
+                    if llm_lines:
+                        for batch in batch_lines(llm_lines, cfg.extractor_batch_max_lines):
+                            job_batches.append((idx, batch, cands))
 
-            _run_windowed(
-                total=len(stage0_data),
-                start_idx=start_idx,
-                window_size=cfg.vllm_num_endpoints,
-                process_fn=lambda idx: _process_extract_job(idx, stage0_data, cfg),
-                progress_fn=_s1_progress,
-                fh=fh,
-                records=records,
-            )
+            # Run all batches through vLLM in parallel windows.
+            # Each batch gets a dedicated endpoint URL — no shared pool.
+            endpoints = cfg.vllm_endpoints()
+            batch_results: Dict[int, List[Dict[str, Any]]] = {}
+            window = len(endpoints)
+            bi = 0
+            while bi < len(job_batches):
+                window_end = min(bi + window, len(job_batches))
+                futures = {}
+                with ThreadPoolExecutor(max_workers=window) as pool:
+                    for wi in range(bi, window_end):
+                        j_idx, batch, cands = job_batches[wi]
+                        ep = endpoints[(wi - bi) % len(endpoints)]
+                        futures[wi] = pool.submit(
+                            extract_mentions_for_batch,
+                            cfg, batch, cands, cfg.extractor_model, ep,
+                        )
+                for wi in range(bi, window_end):
+                    j_idx = job_batches[wi][0]
+                    try:
+                        part = futures[wi].result()
+                        batch_results.setdefault(j_idx, []).extend(part)
+                    except Exception as e:
+                        logger.warning("vLLM extractor batch failed: %s", e)
+                if progress_cb:
+                    progress_cb(window_end - 1, len(job_batches), "stage1_extract",
+                                f"batch {window_end}/{len(job_batches)}",
+                                {"stage": "stage1_extract"})
+                bi = window_end
+
+            # Write one checkpoint record per job in order
+            for idx in range(start_idx, len(stage0_data)):
+                job_key, skip_llm = job_meta[idx]
+                raw_mentions = batch_results.get(idx, [])
+                record = {
+                    "job_index": stage0_data[idx]["job_index"],
+                    "job_key": job_key,
+                    "extractor_model_used": cfg.extractor_model,
+                    "raw_mentions": [serialize_mention(m) for m in raw_mentions],
+                }
+                append_checkpoint_record(fh, record)
+                records.append(record)
         else:
             for idx in range(start_idx, len(stage0_data)):
                 s0 = stage0_data[idx]

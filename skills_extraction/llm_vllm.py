@@ -39,6 +39,60 @@ def _return_endpoint(endpoint: str) -> None:
         _endpoint_pool.put(endpoint)
 
 
+def call_vllm_direct(
+    cfg: PipelineConfig,
+    endpoint: str,
+    model: str,
+    system: str,
+    user: str,
+    temperature: float = 0.1,
+    role: str = "extractor",
+) -> str:
+    """Call a specific vLLM endpoint directly, bypassing the endpoint pool."""
+    last_err: Optional[Exception] = None
+    for attempt in range(cfg.vllm_max_retries):
+        url = f"{endpoint}/chat/completions"
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": temperature,
+            "stream": False,
+        }
+        # Disable Qwen3 thinking mode to avoid wasting tokens on reasoning
+        if cfg.disable_thinking:
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+        try:
+            t0 = time.perf_counter()
+            r = requests.post(
+                url,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=cfg.vllm_timeout_sec,
+            )
+            r.raise_for_status()
+            data = r.json()
+            choices = data.get("choices", [])
+            if not choices:
+                raise ValueError("empty choices in vLLM response")
+            out = choices[0].get("message", {}).get("content", "")
+            if not out:
+                raise ValueError("empty content in vLLM response")
+            elapsed = time.perf_counter() - t0
+            if getattr(cfg, "llm_timing_callback", None):
+                cfg.llm_timing_callback(model, elapsed, role)
+            if cfg.per_call_delay_sec:
+                time.sleep(cfg.per_call_delay_sec)
+            return out
+        except Exception as e:
+            last_err = e
+            logger.warning("vLLM attempt %s (%s) failed: %s", attempt + 1, endpoint, e)
+            time.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f"vLLM failed after {cfg.vllm_max_retries} attempts: {last_err}")
+
+
 def call_vllm(
     cfg: PipelineConfig,
     model: str,
@@ -61,6 +115,8 @@ def call_vllm(
             "temperature": temperature,
             "stream": False,
         }
+        if cfg.disable_thinking:
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
         try:
             t0 = time.perf_counter()
             r = requests.post(
