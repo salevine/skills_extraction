@@ -15,6 +15,7 @@ test_*/
 
 # Docs
 CHAPTER_Skills_Extraction_Pipeline_and_Auditability.md
+NOTES_*.md
 
 # IDE
 .idea/

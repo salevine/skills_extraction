@@ -174,32 +174,54 @@ Examples (run from repository root — the folder that contains `skills_extracti
 
     global _PROGRESS_START
     _PROGRESS_START = time.perf_counter()
+    _stage_starts: dict = {}
+    _last_stage: list = [""]
 
     def _on_progress(job_idx: int, total: int, stage: str, detail: str, extra: object) -> None:
-        detail_safe = (detail or "").encode("ascii", errors="replace").decode("ascii")
-        elapsed = time.perf_counter() - _PROGRESS_START
-        pct = 100 * (job_idx + (0.3 if stage != "done" else 1.0)) / max(1, total)
-        pct = min(99.9, pct)
-        if job_idx + 1 < total and elapsed > 5:
-            rate = (job_idx + 0.5) / elapsed
-            remaining_sec = (total - job_idx - 0.5) / rate if rate > 0 else 0
-            eta = _format_eta(remaining_sec)
-        else:
-            eta = "..."
-        # Show stage name from extra if available
+        now = time.perf_counter()
+
+        # Detect stage transition — print newline and header
         stage_label = ""
         if isinstance(extra, dict):
             stage_label = extra.get("stage", "")
-        if stage_label:
-            stage_label = f"{stage_label} | "
-        bar_w = 20
+        current_stage = stage_label or stage
+        if current_stage != _last_stage[0]:
+            if _last_stage[0]:
+                # Finish previous stage line
+                print()
+            _last_stage[0] = current_stage
+            _stage_starts[current_stage] = now
+            stage_display = current_stage.replace("_", " ").title()
+            print(f"\n  {stage_display}", flush=True)
+
+        # Calculate ETA from stage start
+        stage_start = _stage_starts.get(current_stage, now)
+        elapsed = now - stage_start
+        pct = 100 * (job_idx + 1) / max(1, total)
+        pct = min(99.9, pct)
+        if job_idx + 1 < total and elapsed > 2:
+            rate = (job_idx + 1) / elapsed
+            remaining_sec = (total - job_idx - 1) / rate if rate > 0 else 0
+            eta = _format_eta(remaining_sec)
+        else:
+            eta = "..."
+
+        bar_w = 30
         filled = int(bar_w * pct / 100)
-        bar = "#" * filled + "-" * (bar_w - filled)
-        msg = f"  [{job_idx + 1:>{len(str(total))}}/{total}] [{bar}] {pct:5.1f}% | ETA ~{eta} | {stage_label}{detail_safe}"
+        bar = "█" * filled + "░" * (bar_w - filled)
+
+        # Truncate detail to avoid wrapping
+        max_detail = 40
+        detail_safe = (detail or "").encode("ascii", errors="replace").decode("ascii")
+        if len(detail_safe) > max_detail:
+            detail_safe = detail_safe[:max_detail - 1] + "…"
+
+        msg = f"  {bar} {pct:5.1f}% [{job_idx + 1:>{len(str(total))}}/{total}] ETA {eta:>8s}  {detail_safe}"
+        # Pad with spaces to overwrite previous longer lines
         try:
-            print(f"\r{msg}", end="", flush=True)
+            print(f"\r{msg:<100}", end="", flush=True)
         except UnicodeEncodeError:
-            print(f"\r  [{job_idx + 1}/{total}] {pct:.0f}% | ETA ~{eta}", end="", flush=True)
+            print(f"\r  {pct:.0f}% [{job_idx + 1}/{total}] ETA {eta}", end="", flush=True)
 
     _configure_logging(log_file, quiet_console=True)
     augmented, paths, stats = run_pipeline(

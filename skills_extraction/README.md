@@ -1,9 +1,9 @@
 # Skills extraction (v3) — full guide
 
-Open-vocabulary, **line-level**, **audit-first** skill mention extraction using Ollama.  
+Open-vocabulary, **line-level**, **audit-first** skill mention extraction with multi-backend LLM support (Ollama, vLLM, OpenRouter).
 The **source of truth** is **mention-level** JSON (plus JSONL/CSV exports). Summary reports are **derived**, not primary.
 
-**Current release: 3.0.0** (see **`CHANGELOG.md`** for full history). Highlights: **role-specialized staged pipeline** (span extraction → skill verifier → requirement classifier → hard/soft classifier), **mention-level `pipeline_audit`**, **job-level `pipeline_stage_audit`**, new classifier model/toggle CLI options, and confidence blending that includes secondary classifier outputs.
+**Current release: 3.2.1** (see **`CHANGELOG.md`** for full history). Highlights: **multi-backend architecture** (Ollama / vLLM / OpenRouter), **concurrent multi-GPU extraction** via vLLM with batch-level parallelism, **thinking-mode suppression** for Qwen3, **stage-first pipeline** with intermediate checkpoints and crash-recovery resume, and **server deployment tooling** for remote vLLM clusters.
 
 ---
 
@@ -60,13 +60,23 @@ If you prefer **everything** under one folder only, you can delete the root shim
 ```
 skills-extraction/             # repository root
   Runskills_extraction.py      # optional shim → delegates to skills_extraction.cli
+  deploy.sh                    # rsync code to vLLM server (-s to include sample data)
+  vLLM_run.sh                  # server-side run script (conda + vLLM config)
+  test_vllm.sh                 # curl-based endpoint health check
+  test_simple.py               # minimal vLLM extraction test
   skills_extraction/           # all application code + this README
     __init__.py
     __main__.py                # enables: python -m skills_extraction
-    cli.py                     # argparse + logging setup
-    config.py
+    cli.py                     # argparse + logging setup + progress display
+    config.py                  # PipelineConfig, backend selection, env loading
     schemas.py
-    pipeline.py
+    pipeline.py                # stage orchestration, windowed parallel execution
+    llm_backend.py             # unified LLM dispatcher
+    llm_ollama.py              # Ollama client
+    llm_vllm.py                # vLLM client (pool + direct endpoint modes)
+    llm_openrouter.py          # OpenRouter client
+    llm_extractor.py           # batched span extraction
+    checkpoint.py              # checkpoint save/load/resume
     ... (other modules)
     README.md                  # this file
     CHANGELOG.md               # version history for this tool
@@ -78,8 +88,8 @@ skills-extraction/             # repository root
 ## Requirements
 
 - Python 3.10+ (uses `datetime.timezone`, type hints).
-- **`requests`** — Ollama HTTP API.
-- **`python-dotenv`** — optional `.env.local` / `.env` for Ollama URL and model overrides.
+- **`requests`** — HTTP API for all backends (Ollama, vLLM, OpenRouter).
+- **`python-dotenv`** — optional `.env.local` / `.env` for backend URLs and model overrides.
 
 No fixed skill taxonomy or embedding service is required for the core pipeline.
 
@@ -87,12 +97,24 @@ No fixed skill taxonomy or embedding service is required for the core pipeline.
 
 ## Configuration
 
+### Backend selection
+
+The pipeline supports three LLM backends, selected via `--backend` or `SKILLS_BACKEND` env var:
+
+| Backend | Flag | Use case |
+|---------|------|----------|
+| **Ollama** | `--backend ollama` (default) | Single-GPU or remote Ollama server |
+| **vLLM** | `--vllm` | Multi-GPU parallel inference (recommended for large runs) |
+| **OpenRouter** | `--backend openrouter` | Cloud-hosted models via API |
+
 ### Environment variables
 
 | Variable | Purpose |
 |----------|---------|
+| `SKILLS_BACKEND` | `ollama`, `vllm`, or `openrouter` |
 | `OLLAMA_BASE_URL` | e.g. `http://localhost:11434` |
 | `OLLAMA_URL` | Base or full generate URL; `/api/generate` stripped if present |
+| `OPENROUTER_API_KEY` | API key for OpenRouter backend |
 | `SKILLS_EXTRACTOR_MODEL` | Default extractor model tag |
 | `SKILLS_VERIFIER_MODEL` | Default verifier model tag |
 | `SKILLS_REQUIREMENT_MODEL` | Default requirement classifier model tag |
@@ -102,12 +124,13 @@ No fixed skill taxonomy or embedding service is required for the core pipeline.
 
 ### Defaults (`config.PipelineConfig`)
 
-- Extractor: `qwen2.5:14b`
+- Extractor: `qwen3:14b`
 - Verifier: `mistral-nemo:12b`
 - Requirement classifier: `mistral-nemo:12b`
 - Hard/soft classifier: `mistral-nemo:12b`
 - Fallback if extractor batch fails: `llama3.1:8b`
 - Remote Ollama default: `http://ollama.rs.gsu.edu` (override with `--local` → `http://localhost:11434`)
+- Thinking-mode suppression: enabled by default (`disable_thinking: True`)
 
 ---
 
@@ -119,25 +142,65 @@ Run from the **repository root** (the directory that contains the **`skills_extr
 python -m skills_extraction [OPTIONS]
 ```
 
+### General options
+
 | Option | Description |
 |--------|-------------|
 | `-i`, `--input` | **Required.** Path to JSON: array of jobs or `{ "jobs": [ ... ] }`. |
 | `-o`, `--output-dir` | Output directory (default: `skills_extraction_output`). |
 | `--run-id` | Optional run id; default `YYYYMMDD_HHMMSS`. |
-| `--local` | Use local Ollama at `http://localhost:11434`. |
-| `--extractor-model` | Ollama model tag for extraction. |
-| `--verifier-model` | Ollama model tag for verification. |
-| `--requirement-model` | Ollama model tag for requirement classifier. |
-| `--hardsoft-model` | Ollama model tag for hard/soft classifier. |
-| `--fallback-model` | Used if a batch fails with the primary extractor. |
 | `--sample N` | Process only the first N jobs after load. |
-| `--no-verifier` | Disable the second LLM pass. |
+| `--no-verifier` | Disable the verifier LLM pass. |
 | `--no-requirement-classifier` | Disable requirement classifier pass. |
 | `--no-hardsoft-classifier` | Disable hard/soft classifier pass. |
-| `--skip-llm` | No Ollama calls: structure, `parsed_lines`, `skill_candidates`, quality only. |
+| `--skip-llm` | No LLM calls: structure, `parsed_lines`, `skill_candidates`, quality only. |
 | `--no-reports` | Skip derived quality/frequency/low-confidence reports. |
+| `--no-resume` | Ignore existing checkpoints; overwrite from scratch. |
 | `--batch-lines` | Max lines per extractor request (default `5`). |
+| `--timeout` | HTTP timeout in seconds (default `300`). |
+
+### Backend options
+
+| Option | Description |
+|--------|-------------|
+| `--backend` | `ollama` (default), `openrouter`, or `vllm`. |
+| `--local` | Use local Ollama at `http://localhost:11434`. |
 | `--context-size` | Ollama `num_ctx` (default `32768`). |
+| `--vllm` | Use vLLM backend (also applies `--vllm-*` overrides). |
+| `--vllm-host` | vLLM server hostname (default: `localhost`). |
+| `--vllm-base-port` | First endpoint port (default: `8001`). |
+| `--vllm-num-endpoints` | Number of vLLM endpoints/GPUs (default: `8`). |
+
+### Model overrides
+
+| Option | Description |
+|--------|-------------|
+| `--extractor-model` | Model tag for extraction (default: `qwen3:14b`). |
+| `--verifier-model` | Model tag for verification (default: `mistral-nemo:12b`). |
+| `--requirement-model` | Model tag for requirement classifier. |
+| `--hardsoft-model` | Model tag for hard/soft classifier. |
+| `--fallback-model` | Used if a batch fails with the primary extractor. |
+
+**Important:** When using vLLM, model names must match the HuggingFace model ID registered by the vLLM server (e.g., `Qwen/Qwen3-14B`), not the Ollama tag format (`qwen3:14b`). Use `curl http://localhost:PORT/v1/models` to check.
+
+### Examples
+
+```bash
+# Ollama (local)
+python -m skills_extraction -i jobs.json -o ./out --local --sample 10
+
+# Ollama (remote)
+python -m skills_extraction -i jobs.json -o ./out
+
+# vLLM with 8 GPUs, extraction only
+python -m skills_extraction -i jobs.json -o ./out \
+  --vllm --vllm-host localhost --vllm-base-port 8000 --vllm-num-endpoints 8 \
+  --extractor-model "Qwen/Qwen3-14B" \
+  --no-verifier --no-requirement-classifier --no-hardsoft-classifier
+
+# Structure only (no LLM)
+python -m skills_extraction -i jobs.json -o ./out --skip-llm
+```
 
 **Shim (same options):**
 
@@ -201,11 +264,85 @@ Original fields are **never removed**. New fields include:
 
 ---
 
+## Server deployment (vLLM)
+
+The pipeline can be deployed to a remote server with vLLM workers for multi-GPU extraction. The repo includes deployment scripts tested on an 8x NVIDIA RTX A6000 cluster.
+
+### Setup
+
+```bash
+# Deploy code to server (first time: add -s to include SampleJobs.json)
+./deploy.sh -s
+
+# Subsequent deploys (code only)
+./deploy.sh
+```
+
+The deploy script:
+- Rsyncs the project to `~/skills_extraction/` on the server
+- With `-s`: copies `SampleJobs.json` to `~/jobs/` (the default input path)
+- Excludes `.venv`, `__pycache__`, `.git`, and output directories
+
+### Running on the server
+
+```bash
+# Run via the pre-configured script
+bash ~/skills_extraction/vLLM_run.sh
+
+# Or manually
+conda run --no-capture-output -n skills python -m skills_extraction \
+  --input ../jobs/SampleJobs.json --output-dir ./out \
+  --vllm --vllm-host localhost --vllm-base-port 8000 --vllm-num-endpoints 8 \
+  --extractor-model "Qwen/Qwen3-14B" \
+  --no-verifier --no-requirement-classifier --no-hardsoft-classifier \
+  --sample 20
+```
+
+### Testing endpoints
+
+```bash
+# Test all endpoints
+bash ~/skills_extraction/test_vllm.sh
+
+# Test a single endpoint
+curl http://localhost:8000/v1/models
+
+# Quick extraction test
+python ~/skills_extraction/test_simple.py
+```
+
+### Conda environment
+
+The server uses `conda run` (avoids needing `conda init`). First-time setup:
+
+```bash
+conda create -n skills python=3.11 -y
+conda run -n skills pip install -r requirements.txt
+```
+
+### Deployment notes
+
+- **`conda run` buffering:** Always use `--no-capture-output` or stdout is buffered until process exit, making the pipeline appear to hang.
+- **Model names:** vLLM registers models by HuggingFace ID (`Qwen/Qwen3-14B`), not Ollama tags (`qwen3:14b`). Use `curl localhost:PORT/v1/models` to check.
+- **`--vllm` vs `--backend vllm`:** Use `--vllm` to enable vLLM — this flag triggers the port/host/endpoint overrides. `--backend vllm` alone sets the backend but ignores `--vllm-*` arguments.
+- **Checkpoints are per-run-id:** Multiple runs can share an output directory without collision.
+
+### Performance observations (8x RTX A6000, Qwen3-14B)
+
+| Configuration | 20 jobs (86 batches) | Avg per batch |
+|--------------|---------------------|---------------|
+| Thinking ON, 7 endpoints | ~50 min | 107.9s |
+| Thinking OFF, 8 endpoints | TBD | TBD |
+
+Thinking-mode suppression (`disable_thinking: True`, the default) sends `chat_template_kwargs: {"enable_thinking": false}` in vLLM requests, eliminating ~400 reasoning tokens per call. Isolated test: 19.7s → 1.2s for a simple prompt.
+
+---
+
 ## Module map
 
 | Module | Role |
 |--------|------|
-| `config.py` | `PipelineConfig`, Ollama URL resolution |
+| `config.py` | `PipelineConfig`, backend selection, env loading |
 | `schemas.py` | Dataclasses / enums for lines, candidates, mentions, quality |
 | `io_utils.py` | JSON load, `stable_job_key`, append-only merge |
 | `preprocessing.py` | Raw vs normalized description |
@@ -213,15 +350,19 @@ Original fields are **never removed**. New fields include:
 | `boilerplate.py` | Line-level boilerplate classification |
 | `quality.py` | Document quality scoring |
 | `candidate_mining.py` | Pattern-based candidate spans |
-| `llm_ollama.py` | HTTP + JSON repair |
+| `llm_backend.py` | Unified dispatcher — routes to Ollama / vLLM / OpenRouter |
+| `llm_ollama.py` | Ollama HTTP client + JSON repair |
+| `llm_vllm.py` | vLLM OpenAI-compatible client, endpoint pool, `call_vllm_direct()` |
+| `llm_openrouter.py` | OpenRouter HTTP client |
 | `prompts.py` | Stage-specific prompt text (extract/verify/classify) |
-| `llm_extractor.py` | Batched span extraction |
+| `llm_extractor.py` | Batched span extraction (supports direct endpoint assignment) |
 | `llm_verifier.py` | Skill verifier stage |
 | `llm_requirement_classifier.py` | Requirement classifier stage |
 | `llm_hardsoft_classifier.py` | Hard/soft classifier stage |
 | `confidence.py` | Final confidence blending |
+| `checkpoint.py` | Checkpoint save/load, resume logic, serialization |
 | `exporters.py` | JSON / JSONL / CSV / reports |
-| `pipeline.py` | Orchestration |
+| `pipeline.py` | Orchestration, windowed parallel execution |
 | `run_stats.py` | Run timing / LLM stats for logs and `run_summary` JSON |
 
 ---

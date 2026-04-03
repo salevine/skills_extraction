@@ -19,5 +19,4 @@ conda run --no-capture-output -n skills python -m skills_extraction \
   --extractor-model "Qwen/Qwen3-14B" \
   --no-verifier \
   --no-requirement-classifier \
-  --no-hardsoft-classifier \
-  --sample 5
+  --no-hardsoft-classifier
