@@ -503,6 +503,7 @@ def _run_stage1_extract(
             endpoints = cfg.vllm_endpoints()
             batch_results: Dict[int, List[Dict[str, Any]]] = {}
             completed_count = [0]  # mutable for closure
+            failed_count = [0]
             total_batches = len(job_batches)
 
             with ThreadPoolExecutor(max_workers=len(endpoints)) as pool:
@@ -522,13 +523,20 @@ def _run_stage1_extract(
                         part = future.result()
                         batch_results.setdefault(j_idx, []).extend(part)
                     except Exception as e:
-                        logger.warning("vLLM extractor batch %d failed: %s", bi, e)
+                        # Log to file only — avoid breaking the progress line
+                        logger.debug("vLLM extractor batch %d failed: %s", bi, e)
+                        failed_count[0] += 1
                     completed_count[0] += 1
                     if progress_cb:
+                        fail_info = f" ({failed_count[0]} failed)" if failed_count[0] else ""
                         progress_cb(completed_count[0] - 1, total_batches,
                                     "stage1_extract",
-                                    f"batch {completed_count[0]}/{total_batches}",
+                                    f"batch {completed_count[0]}/{total_batches}{fail_info}",
                                     {"stage": "stage1_extract"})
+
+            if failed_count[0]:
+                logger.warning("vLLM extraction: %d/%d batches failed (timeouts/errors)",
+                               failed_count[0], total_batches)
 
             # Write one checkpoint record per job in order
             for idx in range(start_idx, len(stage0_data)):
