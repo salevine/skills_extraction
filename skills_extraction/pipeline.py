@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -496,35 +496,39 @@ def _run_stage1_extract(
                         for batch in batch_lines(llm_lines, cfg.extractor_batch_max_lines):
                             job_batches.append((idx, batch, cands))
 
-            # Run all batches through vLLM in parallel windows.
-            # Each batch gets a dedicated endpoint URL — no shared pool.
+            # Run all batches through vLLM as a true work queue.
+            # Submit all batches to a fixed-size thread pool — each worker
+            # grabs the next batch as soon as it finishes, keeping all GPUs
+            # busy. No window-based blocking.
             endpoints = cfg.vllm_endpoints()
             batch_results: Dict[int, List[Dict[str, Any]]] = {}
-            window = len(endpoints)
-            bi = 0
-            while bi < len(job_batches):
-                window_end = min(bi + window, len(job_batches))
-                futures = {}
-                with ThreadPoolExecutor(max_workers=window) as pool:
-                    for wi in range(bi, window_end):
-                        j_idx, batch, cands = job_batches[wi]
-                        ep = endpoints[(wi - bi) % len(endpoints)]
-                        futures[wi] = pool.submit(
-                            extract_mentions_for_batch,
-                            cfg, batch, cands, cfg.extractor_model, ep,
-                        )
-                for wi in range(bi, window_end):
-                    j_idx = job_batches[wi][0]
+            completed_count = [0]  # mutable for closure
+            total_batches = len(job_batches)
+
+            with ThreadPoolExecutor(max_workers=len(endpoints)) as pool:
+                future_to_idx = {}
+                for bi, (j_idx, batch, cands) in enumerate(job_batches):
+                    ep = endpoints[bi % len(endpoints)]
+                    f = pool.submit(
+                        extract_mentions_for_batch,
+                        cfg, batch, cands, cfg.extractor_model, ep,
+                    )
+                    future_to_idx[f] = bi
+
+                for future in as_completed(future_to_idx):
+                    bi = future_to_idx[future]
+                    j_idx = job_batches[bi][0]
                     try:
-                        part = futures[wi].result()
+                        part = future.result()
                         batch_results.setdefault(j_idx, []).extend(part)
                     except Exception as e:
-                        logger.warning("vLLM extractor batch failed: %s", e)
-                if progress_cb:
-                    progress_cb(window_end - 1, len(job_batches), "stage1_extract",
-                                f"batch {window_end}/{len(job_batches)}",
-                                {"stage": "stage1_extract"})
-                bi = window_end
+                        logger.warning("vLLM extractor batch %d failed: %s", bi, e)
+                    completed_count[0] += 1
+                    if progress_cb:
+                        progress_cb(completed_count[0] - 1, total_batches,
+                                    "stage1_extract",
+                                    f"batch {completed_count[0]}/{total_batches}",
+                                    {"stage": "stage1_extract"})
 
             # Write one checkpoint record per job in order
             for idx in range(start_idx, len(stage0_data)):
