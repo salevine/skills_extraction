@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Kill all vLLM serve processes owned by the current user.
+# Safe: only matches "vllm serve" processes, not other python work.
+
+echo "Stopping all vLLM workers..."
+
+PIDS=$(pgrep -u "$(whoami)" -f "vllm serve" || true)
+
+if [ -z "$PIDS" ]; then
+  echo "No vLLM workers running."
+  exit 0
+fi
+
+echo "$PIDS" | xargs kill
+echo "Sent SIGTERM to: $PIDS"
+
+# Wait for them to exit
+echo "Waiting for processes to exit..."
+for pid in $PIDS; do
+  tail --pid="$pid" -f /dev/null 2>/dev/null || true
+done
+
+echo "All vLLM workers stopped."

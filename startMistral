@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# -----------------------------
+# ENV SETUP
+# -----------------------------
+source ~/miniconda3/bin/activate qwen
+
+export TMPDIR=/home/stacey/tmp
+export PIP_CACHE_DIR=/home/stacey/pip-cache
+
+mkdir -p "$TMPDIR" "$PIP_CACHE_DIR" ~/vllm-logs
+
+# -----------------------------
+# CONFIG
+# -----------------------------
+MODEL="mistralai/Mistral-Nemo-Instruct-2407"
+HOST="127.0.0.1"
+BASE_PORT=8000
+START_GPU=0
+MAX_MODEL_LEN=16384
+GPU_UTIL=0.90
+SLEEP_BETWEEN=5
+
+# -----------------------------
+# INPUT ARG
+# -----------------------------
+if [ $# -lt 1 ]; then
+  echo "Usage: $0 <num_gpus>"
+  echo "Example: $0 4"
+  exit 1
+fi
+
+NUM_WORKERS="$1"
+
+if ! [[ "$NUM_WORKERS" =~ ^[0-9]+$ ]]; then
+  echo "Error: num_gpus must be an integer"
+  exit 1
+fi
+
+if [ "$NUM_WORKERS" -lt 1 ] || [ "$NUM_WORKERS" -gt 8 ]; then
+  echo "Error: num_gpus must be between 1 and 8"
+  exit 1
+fi
+
+echo "Starting $NUM_WORKERS vLLM workers..."
+echo "Model: $MODEL"
+echo "Ports: $BASE_PORT → $((BASE_PORT + NUM_WORKERS - 1))"
+echo
+
+# -----------------------------
+# START WORKERS
+# -----------------------------
+for ((i=0; i<NUM_WORKERS; i++)); do
+  GPU=$((START_GPU + i))
+  PORT=$((BASE_PORT + i))
+  LOGFILE="$HOME/vllm-logs/mistral_gpu${GPU}_port${PORT}.log"
+
+  echo "→ Starting GPU $GPU on port $PORT"
+
+  CUDA_VISIBLE_DEVICES="$GPU" nohup vllm serve "$MODEL" \
+    --host "$HOST" \
+    --port "$PORT" \
+    --max-model-len "$MAX_MODEL_LEN" \
+    --gpu-memory-utilization "$GPU_UTIL" \
+    > "$LOGFILE" 2>&1 &
+
+  echo "   Log: $LOGFILE"
+
+  sleep "$SLEEP_BETWEEN"
+done
+
+echo
+echo "Started $NUM_WORKERS workers"
+echo "Logs: ~/vllm-logs/"
+echo "Check status with: nvidia-smi"

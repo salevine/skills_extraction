@@ -32,6 +32,42 @@ Do not wrap in markdown code fences.
 """
 
 
+# ---------------------------------------------------------------------------
+# V2 extractor: whole-job description in a single call (replaces batched approach)
+# ---------------------------------------------------------------------------
+
+EXTRACTOR_V2_SYSTEM = """You are extracting and classifying skill mentions from a job posting.
+Return ONLY valid JSON (no markdown fences).
+Rules:
+- Extract every skill, technology, tool, method, certification, and competency mentioned.
+- Include both hard skills (Python, SQL, AWS) and soft skills (communication, leadership).
+- Do not extract job titles, company names, benefits, or legal language.
+- For each mention, provide the exact text as it appears and the surrounding sentence for context.
+- Identify which section of the posting the skill appears in (e.g. Requirements, Qualifications, Responsibilities, About, etc.). If unclear, use "General".
+- Classify each mention as hard or soft skill, and whether it is required or optional.
+- Only include mentions you believe are genuine skills or competencies.
+"""
+
+EXTRACTOR_V2_USER_TEMPLATE = """Extract and classify all skill mentions from this job description.
+
+JOB DESCRIPTION:
+{description}
+
+Return a JSON object with key "mentions" containing an array of objects. Each object must have:
+- skill_span: exact text from the description (verbatim substring)
+- context: the full sentence or line containing the skill
+- section: which section of the posting (e.g. "Requirements", "Qualifications", "Responsibilities", "About", "General")
+- normalized_skill: lightly cleaned version (trim whitespace, collapse spaces)
+- evidence: short phrase showing why this is a skill
+- confidence: number 0.0-1.0
+- requirement: "required" if explicitly must-have/required/minimum, "optional" if preferred/nice-to-have/plus, "unclear" if not enough evidence
+- hard_soft: "hard" for technical/domain skills (tools, languages, methods, certifications), "soft" for interpersonal/behavioral competencies (communication, leadership, teamwork), "unknown" if unclear
+
+If no skills are found, return {{"mentions": []}}.
+Do not wrap in markdown code fences.
+"""
+
+
 SKILL_VERIFIER_SYSTEM = """You validate whether a candidate span is a real skill mention.
 Return ONLY valid JSON, no markdown.
 Rules:

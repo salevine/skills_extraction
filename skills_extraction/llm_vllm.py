@@ -61,8 +61,10 @@ def call_vllm_direct(
             "temperature": temperature,
             "stream": False,
         }
-        # Disable Qwen3 thinking mode to avoid wasting tokens on reasoning
-        if cfg.disable_thinking:
+        # Disable Qwen3 thinking mode to avoid wasting tokens on reasoning.
+        # Only applied for Qwen models — other models (e.g. Mistral-Nemo)
+        # don't support this chat_template kwarg.
+        if cfg.disable_thinking and "qwen" in model.lower():
             payload["chat_template_kwargs"] = {"enable_thinking": False}
         try:
             t0 = time.perf_counter()
@@ -81,6 +83,7 @@ def call_vllm_direct(
             if not out:
                 raise ValueError("empty content in vLLM response")
             elapsed = time.perf_counter() - t0
+            logger.debug("vLLM %s (%s) %.1fs", role, endpoint, elapsed)
             if getattr(cfg, "llm_timing_callback", None):
                 cfg.llm_timing_callback(model, elapsed, role)
             if cfg.per_call_delay_sec:
@@ -115,7 +118,7 @@ def call_vllm(
             "temperature": temperature,
             "stream": False,
         }
-        if cfg.disable_thinking:
+        if cfg.disable_thinking and "qwen" in model.lower():
             payload["chat_template_kwargs"] = {"enable_thinking": False}
         try:
             t0 = time.perf_counter()
@@ -135,6 +138,7 @@ def call_vllm(
                 raise ValueError("empty content in vLLM response")
             elapsed = time.perf_counter() - t0
             _return_endpoint(endpoint)
+            logger.debug("vLLM %s (%s) %.1fs", role, endpoint, elapsed)
             if getattr(cfg, "llm_timing_callback", None):
                 cfg.llm_timing_callback(model, elapsed, role)
             if cfg.per_call_delay_sec:

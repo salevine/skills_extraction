@@ -47,7 +47,7 @@ def _configure_logging(log_path: Path, quiet_console: bool = False) -> None:
     root.addHandler(fh)
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.WARNING if quiet_console else logging.INFO)
-    ch.setFormatter(logging.Formatter("%(levelname)s - %(message)s"))
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s - %(message)s", datefmt="%H:%M:%S"))
     root.addHandler(ch)
 
 

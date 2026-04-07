@@ -42,7 +42,7 @@ from .exporters import (
     write_quality_report,
 )
 from .io_utils import augment_job_record, stable_job_key
-from .llm_extractor import batch_lines, extract_mentions_for_batch
+from .llm_extractor import batch_lines, extract_mentions_for_batch, extract_mentions_for_job
 from .llm_hardsoft_classifier import classify_hard_soft
 from .llm_requirement_classifier import classify_requirement_level
 from .llm_verifier import verify_mention
@@ -376,7 +376,12 @@ def _process_hardsoft_item(
 
 
 # ---------------------------------------------------------------------------
-# Stage 0: Preprocess all jobs (no LLM)
+# Stage 0: Preprocess all jobs (no LLM) — DISABLED
+# Retained for reference. This stage split descriptions into lines, labeled
+# boilerplate/sections, mined regex candidates, and assessed quality. It
+# enabled the 5-line batching approach in stage 1. Disabled because sending
+# full job descriptions to the LLM in one call is simpler, more reliable
+# (fewer HTTP calls), and preserves cross-line context.
 # ---------------------------------------------------------------------------
 
 def _run_stage0_preprocess(
@@ -451,11 +456,11 @@ def _run_stage0_preprocess(
 
 
 # ---------------------------------------------------------------------------
-# Stage 1: Extract all jobs (qwen3:14b stays loaded)
+# Stage 1: Extract all jobs — one LLM call per job (V2)
 # ---------------------------------------------------------------------------
 
 def _run_stage1_extract(
-    stage0_data: List[Dict[str, Any]],
+    jobs: List[Dict[str, Any]],
     cfg: PipelineConfig,
     run_id: str,
     ckpt_dir: Path,
@@ -463,7 +468,7 @@ def _run_stage1_extract(
     stats: Optional[RunStats] = None,
     start_idx: int = 0,
 ) -> List[Dict[str, Any]]:
-    """Run LLM extraction on all jobs. qwen3:14b stays loaded for the entire stage."""
+    """Run LLM extraction on all jobs. One call per job, full description."""
     path = checkpoint_path(ckpt_dir.parent, run_id, "stage1_extracted")
     records: List[Dict[str, Any]] = []
 
@@ -474,76 +479,57 @@ def _run_stage1_extract(
     mode = "a" if start_idx > 0 else "w"
     with open(path, mode, encoding="utf-8") as fh:
         if start_idx == 0:
-            write_checkpoint_header(fh, run_id, "stage1_extracted", len(stage0_data))
+            write_checkpoint_header(fh, run_id, "stage1_extracted", len(jobs))
 
         if cfg.backend == "vllm":
-            # vLLM parallel: process batches across all jobs concurrently.
-            # We flatten all batches first, run them in parallel windows,
-            # then reassemble results per job. This avoids the deadlock that
-            # occurs when parallelizing at the job level (each job needs
-            # multiple batches, each checking out an endpoint).
-            job_batches = []  # list of (job_idx, batch, candidates)
-            job_meta = {}     # job_idx -> (job_key, skip_llm)
-            for idx in range(start_idx, len(stage0_data)):
-                s0 = stage0_data[idx]
-                job_meta[idx] = (s0["job_key"], s0["skip_llm"])
-                if not s0["skip_llm"]:
-                    all_lines = [deserialize_parsed_line(d) for d in s0["parsed_lines"]]
-                    llm_line_set = set(s0["llm_line_indices"])
-                    llm_lines = [pl for pl in all_lines if pl.line_index in llm_line_set]
-                    cands = [deserialize_candidate(d) for d in s0["candidates"]]
-                    if llm_lines:
-                        for batch in batch_lines(llm_lines, cfg.extractor_batch_max_lines):
-                            job_batches.append((idx, batch, cands))
-
-            # Run all batches through vLLM as a true work queue.
-            # Submit all batches to a fixed-size thread pool — each worker
-            # grabs the next batch as soon as it finishes, keeping all GPUs
-            # busy. No window-based blocking.
+            # vLLM parallel: one LLM call per job, 8 concurrent workers.
+            # Each worker gets a dedicated endpoint via round-robin.
             endpoints = cfg.vllm_endpoints()
-            batch_results: Dict[int, List[Dict[str, Any]]] = {}
-            completed_count = [0]  # mutable for closure
+            completed_count = [0]
             failed_count = [0]
-            total_batches = len(job_batches)
+            total_jobs = len(jobs) - start_idx
+            job_results: Dict[int, List[Dict[str, Any]]] = {}
 
             with ThreadPoolExecutor(max_workers=len(endpoints)) as pool:
                 future_to_idx = {}
-                for bi, (j_idx, batch, cands) in enumerate(job_batches):
-                    ep = endpoints[bi % len(endpoints)]
+                for idx in range(start_idx, len(jobs)):
+                    job = jobs[idx]
+                    job_key = stable_job_key(job, idx)
+                    ep = endpoints[idx % len(endpoints)]
                     f = pool.submit(
-                        extract_mentions_for_batch,
-                        cfg, batch, cands, cfg.extractor_model, ep,
+                        extract_mentions_for_job,
+                        cfg, job, job_key, cfg.extractor_model, ep,
                     )
-                    future_to_idx[f] = bi
+                    future_to_idx[f] = idx
 
                 for future in as_completed(future_to_idx):
-                    bi = future_to_idx[future]
-                    j_idx = job_batches[bi][0]
+                    idx = future_to_idx[future]
                     try:
-                        part = future.result()
-                        batch_results.setdefault(j_idx, []).extend(part)
+                        mentions = future.result()
+                        job_results[idx] = mentions
                     except Exception as e:
-                        # Log to file only — avoid breaking the progress line
-                        logger.debug("vLLM extractor batch %d failed: %s", bi, e)
+                        logger.debug("vLLM extractor job %d failed: %s", idx, e)
+                        job_results[idx] = []
                         failed_count[0] += 1
                     completed_count[0] += 1
                     if progress_cb:
                         fail_info = f" ({failed_count[0]} failed)" if failed_count[0] else ""
-                        progress_cb(completed_count[0] - 1, total_batches,
+                        progress_cb(completed_count[0] - 1, total_jobs,
                                     "stage1_extract",
-                                    f"batch {completed_count[0]}/{total_batches}{fail_info}",
+                                    f"job {completed_count[0]}/{total_jobs}{fail_info}",
                                     {"stage": "stage1_extract"})
 
             if failed_count[0]:
-                logger.warning("vLLM extraction: %d/%d batches failed (timeouts/errors)",
-                               failed_count[0], total_batches)
+                logger.warning("vLLM extraction: %d/%d jobs failed (timeouts/errors)",
+                               failed_count[0], total_jobs)
 
-            # Write one checkpoint record per job in order
-            for idx in range(start_idx, len(stage0_data)):
-                job_key, skip_llm = job_meta[idx]
-                raw_mentions = batch_results.get(idx, [])
+            # Write checkpoint records in job order
+            for idx in range(start_idx, len(jobs)):
+                job = jobs[idx]
+                job_key = stable_job_key(job, idx)
+                raw_mentions = job_results.get(idx, [])
                 record = {
-                    "job_index": stage0_data[idx]["job_index"],
+                    "job_index": idx,
                     "job_key": job_key,
                     "extractor_model_used": cfg.extractor_model,
                     "raw_mentions": [serialize_mention(m) for m in raw_mentions],
@@ -551,50 +537,34 @@ def _run_stage1_extract(
                 append_checkpoint_record(fh, record)
                 records.append(record)
         else:
-            for idx in range(start_idx, len(stage0_data)):
-                s0 = stage0_data[idx]
-                job_key = s0["job_key"]
-                skip_llm = s0["skip_llm"]
+            # Ollama / OpenRouter: sequential, one call per job
+            for idx in range(start_idx, len(jobs)):
+                job = jobs[idx]
+                job_key = stable_job_key(job, idx)
 
                 if progress_cb:
-                    progress_cb(idx, len(stage0_data), "stage1_extract",
+                    progress_cb(idx, len(jobs), "stage1_extract",
                                 f"extracting {job_key}",
                                 {"stage": "stage1_extract"})
 
                 extractor_model_used = cfg.extractor_model
-                raw_mentions: List[Dict[str, Any]] = []
-
-                if not skip_llm:
-                    all_lines = [deserialize_parsed_line(d) for d in s0["parsed_lines"]]
-                    llm_line_set = set(s0["llm_line_indices"])
-                    llm_lines = [pl for pl in all_lines if pl.line_index in llm_line_set]
-                    candidates = [deserialize_candidate(d) for d in s0["candidates"]]
-
-                    if llm_lines:
-                        batches = batch_lines(llm_lines, cfg.extractor_batch_max_lines)
-                        for batch_idx, batch in enumerate(batches):
-                            if progress_cb:
-                                progress_cb(idx, len(stage0_data), "stage1_extract",
-                                            f"batch {batch_idx+1}/{len(batches)} for {job_key}",
-                                            {"stage": "stage1_extract"})
-                            try:
-                                part = extract_mentions_for_batch(
-                                    cfg, batch, candidates, model=cfg.extractor_model
-                                )
-                                raw_mentions.extend(part)
-                            except Exception as e:
-                                logger.warning("Extractor batch failed (%s), trying fallback", e)
-                                try:
-                                    part = extract_mentions_for_batch(
-                                        cfg, batch, candidates, model=cfg.fallback_model
-                                    )
-                                    extractor_model_used = cfg.fallback_model
-                                    raw_mentions.extend(part)
-                                except Exception as e2:
-                                    logger.error("Fallback extractor failed: %s", e2)
+                try:
+                    raw_mentions = extract_mentions_for_job(
+                        cfg, job, job_key, model=cfg.extractor_model,
+                    )
+                except Exception as e:
+                    logger.warning("Extractor failed for %s (%s), trying fallback", job_key, e)
+                    try:
+                        raw_mentions = extract_mentions_for_job(
+                            cfg, job, job_key, model=cfg.fallback_model,
+                        )
+                        extractor_model_used = cfg.fallback_model
+                    except Exception as e2:
+                        logger.error("Fallback extractor failed for %s: %s", job_key, e2)
+                        raw_mentions = []
 
                 record = {
-                    "job_index": s0["job_index"],
+                    "job_index": idx,
                     "job_key": job_key,
                     "extractor_model_used": extractor_model_used,
                     "raw_mentions": [serialize_mention(m) for m in raw_mentions],
@@ -611,7 +581,6 @@ def _run_stage1_extract(
 # ---------------------------------------------------------------------------
 
 def _run_stage2_verify(
-    stage0_data: List[Dict[str, Any]],
     stage1_data: List[Dict[str, Any]],
     cfg: PipelineConfig,
     run_id: str,
@@ -629,7 +598,7 @@ def _run_stage2_verify(
         records = records[:start_idx]
 
     # Build flat list of (job_index, job_key, mention_idx, mention, parsed_line)
-    mention_tasks = _build_mention_task_list(stage0_data, stage1_data)
+    mention_tasks = _build_mention_task_list(stage1_data)
     total_mentions = len(mention_tasks)
 
     mode = "a" if start_idx > 0 else "w"
@@ -736,7 +705,6 @@ def _run_stage2_verify(
 # ---------------------------------------------------------------------------
 
 def _run_stage3_requirement(
-    stage0_data: List[Dict[str, Any]],
     stage1_data: List[Dict[str, Any]],
     stage2_data: List[Dict[str, Any]],
     cfg: PipelineConfig,
@@ -754,7 +722,7 @@ def _run_stage3_requirement(
         _, records = load_checkpoint(path)
         records = records[:start_idx]
 
-    mention_tasks = _build_mention_task_list(stage0_data, stage1_data)
+    mention_tasks = _build_mention_task_list(stage1_data)
     # Build verifier lookup: (job_index, mention_idx) -> verifier_output
     v_lookup = {(r["job_index"], r["mention_idx"]): r["verifier_output"] for r in stage2_data}
     total_mentions = len(mention_tasks)
@@ -859,7 +827,6 @@ def _run_stage3_requirement(
 # ---------------------------------------------------------------------------
 
 def _run_stage4_hardsoft(
-    stage0_data: List[Dict[str, Any]],
     stage1_data: List[Dict[str, Any]],
     stage2_data: List[Dict[str, Any]],
     cfg: PipelineConfig,
@@ -877,7 +844,7 @@ def _run_stage4_hardsoft(
         _, records = load_checkpoint(path)
         records = records[:start_idx]
 
-    mention_tasks = _build_mention_task_list(stage0_data, stage1_data)
+    mention_tasks = _build_mention_task_list(stage1_data)
     v_lookup = {(r["job_index"], r["mention_idx"]): r["verifier_output"] for r in stage2_data}
     total_mentions = len(mention_tasks)
 
@@ -982,7 +949,6 @@ def _run_stage4_hardsoft(
 
 def _run_stage5_assemble(
     jobs: List[Dict[str, Any]],
-    stage0_data: List[Dict[str, Any]],
     stage1_data: List[Dict[str, Any]],
     stage2_data: List[Dict[str, Any]],
     stage3_data: List[Dict[str, Any]],
@@ -991,7 +957,7 @@ def _run_stage5_assemble(
     run_id: str,
     started: str,
 ) -> List[Dict[str, Any]]:
-    """Assemble all stage data into augmented job records (identical output to original pipeline)."""
+    """Assemble all stage data into augmented job records."""
     # Index stage2/3/4 by (job_index, mention_idx)
     v_lookup = {(r["job_index"], r["mention_idx"]): r["verifier_output"] for r in stage2_data}
     req_lookup = {(r["job_index"], r["mention_idx"]): r["requirement_output"] for r in stage3_data}
@@ -1002,14 +968,10 @@ def _run_stage5_assemble(
 
     augmented: List[Dict[str, Any]] = []
 
-    for s0 in stage0_data:
-        job_idx = s0["job_index"]
-        job_key = s0["job_key"]
-        job = jobs[job_idx]
-        s1 = s1_by_job.get(job_idx, {})
-
-        lines = [deserialize_parsed_line(d) for d in s0["parsed_lines"]]
-        candidates = [deserialize_candidate(d) for d in s0["candidates"]]
+    for idx, job in enumerate(jobs):
+        job_key = stable_job_key(job, idx)
+        title, desc_raw = extract_description_fields(job)
+        s1 = s1_by_job.get(idx, {})
         extractor_model_used = s1.get("extractor_model_used", cfg.extractor_model)
 
         raw_mentions_ser = s1.get("raw_mentions", [])
@@ -1042,10 +1004,13 @@ def _run_stage5_assemble(
             evidence = str(m.get("evidence", span))
             evidence_ok = evidence in line_text if evidence else False
             raw_conf = float(m.get("span_confidence", m.get("confidence", 0.7)))
-            rules = _matching_rules(candidates, pl.line_id, g0, g1)
+            rules = ["llm_extractor"]
 
             # --- Verifier output ---
-            vout = v_lookup.get((job_idx, m_idx), {"status": "skipped"})
+            # If the combined extractor provided is_skill, use it directly.
+            # Otherwise fall back to stage 2 lookup.
+            extractor_is_skill = m.get("is_skill")
+            vout = v_lookup.get((idx, m_idx), {"status": "skipped"})
             v_status = vout.get("status", "skipped")
             v_model = vout.get("model", "")
             v_conf = vout.get("confidence")
@@ -1056,9 +1021,56 @@ def _run_stage5_assemble(
             if v_status == "rejected":
                 stage_counters["skill_verifier_rejected"] += 1
 
-            is_skill = _mention_is_skill(vout)
+            if extractor_is_skill is not None:
+                is_skill = bool(extractor_is_skill)
+                v_status = "extractor"
+                v_conf = raw_conf
+            else:
+                is_skill = _mention_is_skill(vout)
 
-            # Build pipeline_audit.extractor
+            # --- Requirement output ---
+            # If the combined extractor provided requirement_level, use it.
+            # Otherwise fall back to stage 3 lookup.
+            extractor_req = m.get("requirement_level")
+            rout = req_lookup.get((idx, m_idx), {"status": "skipped"})
+            req_status = rout.get("status", "skipped")
+            req_model = rout.get("model", "")
+            req_conf = rout.get("confidence")
+            req_notes = rout.get("notes", "")
+
+            if extractor_req and extractor_req in ("required", "optional", "unclear"):
+                req_lvl = extractor_req
+                req_status = "extractor"
+                req_conf = raw_conf
+            else:
+                req_lvl = rout.get("requirement_level", "unclear")
+                if req_status == "parse_failed":
+                    stage_counters["requirement_parse_failed"] += 1
+                if req_status == "error":
+                    stage_counters["stage_errors"] += 1
+
+            # --- Hard/soft output ---
+            # If the combined extractor provided hard_soft, use it.
+            # Otherwise fall back to stage 4 lookup.
+            extractor_hs = m.get("hard_soft")
+            hsout = hs_lookup.get((idx, m_idx), {"status": "skipped"})
+            hs_status = hsout.get("status", "skipped")
+            hs_model = hsout.get("model", "")
+            hs_conf = hsout.get("confidence")
+            hs_notes = hsout.get("notes", "")
+
+            if extractor_hs and extractor_hs in ("hard", "soft", "unknown"):
+                hard_soft = extractor_hs
+                hs_status = "extractor"
+                hs_conf = raw_conf
+            else:
+                hard_soft = hsout.get("hard_soft", "unknown")
+                if hs_status == "parse_failed":
+                    stage_counters["hardsoft_parse_failed"] += 1
+                if hs_status == "error":
+                    stage_counters["stage_errors"] += 1
+
+            # Build pipeline_audit
             pipeline_audit: Dict[str, Any] = {
                 "extractor": {
                     "status": "completed",
@@ -1071,86 +1083,14 @@ def _run_stage5_assemble(
                         "evidence": evidence,
                         "span_confidence": raw_conf,
                         "reason": str(m.get("reason", "")),
+                        "requirement_level": req_lvl,
+                        "hard_soft": hard_soft,
                     },
                 },
-                "skill_verifier": {"status": "skipped", "model": ""},
-                "requirement_classifier": {"status": "skipped", "model": ""},
-                "hardsoft_classifier": {"status": "skipped", "model": ""},
+                "skill_verifier": {"status": v_status, "model": v_model},
+                "requirement_classifier": {"status": req_status, "model": req_model},
+                "hardsoft_classifier": {"status": hs_status, "model": hs_model},
             }
-
-            # Populate verifier audit
-            if v_status != "skipped":
-                pipeline_audit["skill_verifier"] = {
-                    "status": v_status,
-                    "model": v_model,
-                }
-                if v_status == "error":
-                    pipeline_audit["skill_verifier"]["error"] = v_notes
-                else:
-                    pipeline_audit["skill_verifier"]["output"] = {
-                        "is_skill": vout.get("is_skill", True),
-                        "confidence": v_conf,
-                        "evidence": vout.get("evidence", evidence),
-                        "notes": v_notes,
-                    }
-                if v_status == "error":
-                    stage_counters["stage_errors"] += 1
-
-            # --- Requirement output ---
-            rout = req_lookup.get((job_idx, m_idx), {"status": "skipped"})
-            req_status = rout.get("status", "skipped")
-            req_model = rout.get("model", "")
-            req_conf = rout.get("confidence")
-            req_notes = rout.get("notes", "")
-            req_lvl = rout.get("requirement_level", "unclear")
-
-            if req_status == "parse_failed":
-                stage_counters["requirement_parse_failed"] += 1
-            if req_status == "error":
-                stage_counters["stage_errors"] += 1
-
-            if req_status != "skipped":
-                pipeline_audit["requirement_classifier"] = {
-                    "status": req_status,
-                    "model": req_model,
-                }
-                if req_status == "error":
-                    pipeline_audit["requirement_classifier"]["error"] = req_notes
-                else:
-                    pipeline_audit["requirement_classifier"]["output"] = {
-                        "requirement_level": req_lvl,
-                        "confidence": req_conf,
-                        "evidence": rout.get("evidence", evidence),
-                        "notes": req_notes,
-                    }
-
-            # --- Hard/soft output ---
-            hsout = hs_lookup.get((job_idx, m_idx), {"status": "skipped"})
-            hs_status = hsout.get("status", "skipped")
-            hs_model = hsout.get("model", "")
-            hs_conf = hsout.get("confidence")
-            hs_notes = hsout.get("notes", "")
-            hard_soft = hsout.get("hard_soft", "unknown")
-
-            if hs_status == "parse_failed":
-                stage_counters["hardsoft_parse_failed"] += 1
-            if hs_status == "error":
-                stage_counters["stage_errors"] += 1
-
-            if hs_status != "skipped":
-                pipeline_audit["hardsoft_classifier"] = {
-                    "status": hs_status,
-                    "model": hs_model,
-                }
-                if hs_status == "error":
-                    pipeline_audit["hardsoft_classifier"]["error"] = hs_notes
-                else:
-                    pipeline_audit["hardsoft_classifier"]["output"] = {
-                        "hard_soft": hard_soft,
-                        "confidence": hs_conf,
-                        "evidence": hsout.get("evidence", evidence),
-                        "notes": hs_notes,
-                    }
 
             # --- Final confidence ---
             final_c = compute_final_confidence(
@@ -1208,7 +1148,6 @@ def _run_stage5_assemble(
             skill_mentions.append(sm.to_dict())
 
         completed = dt.datetime.now(dt.timezone.utc).isoformat()
-        title = s0.get("title", "")
         meta = ExtractionMetadata(
             run_id=run_id,
             pipeline_version=cfg.pipeline_version,
@@ -1218,18 +1157,14 @@ def _run_stage5_assemble(
             started_at=started,
             completed_at=completed,
             extra={
-                "job_title_snapshot": title[:200],
+                "job_title_snapshot": (title or "")[:200],
                 "requirement_model": cfg.requirement_model if cfg.requirement_classifier_enabled else "",
                 "hardsoft_model": cfg.hardsoft_model if cfg.hardsoft_classifier_enabled else "",
             },
         )
 
         augmentation = {
-            "description_raw": s0["desc_raw"],
-            "description_normalized": s0["desc_normalized"],
-            "quality_assessment": s0["quality_assessment"],
-            "parsed_lines": s0["parsed_lines"],
-            "skill_candidates": [serialize_candidate(c) for c in candidates],
+            "description_raw": desc_raw,
             "skill_mentions": skill_mentions,
             "pipeline_stage_audit": {
                 "stage_counters": stage_counters,
@@ -1248,23 +1183,23 @@ def _run_stage5_assemble(
 
 
 # ---------------------------------------------------------------------------
-# Helper: build flat mention task list from stage0 + stage1
+# Helper: build flat mention task list from stage1 data
 # ---------------------------------------------------------------------------
 
 def _build_mention_task_list(
-    stage0_data: List[Dict[str, Any]],
     stage1_data: List[Dict[str, Any]],
 ) -> List[Tuple[int, str, int, Dict[str, Any], ParsedLine]]:
     """
     Build a flat ordered list of (job_index, job_key, mention_idx, mention_dict, parsed_line)
     across all jobs, for stages 2-4 to iterate over.
+
+    Each mention carries its own _parsed_line (created by extract_mentions_for_job),
+    so this no longer needs stage0_data.
     """
-    s1_by_job = {r["job_index"]: r for r in stage1_data}
     tasks: List[Tuple[int, str, int, Dict[str, Any], ParsedLine]] = []
-    for s0 in stage0_data:
-        job_idx = s0["job_index"]
-        job_key = s0["job_key"]
-        s1 = s1_by_job.get(job_idx, {})
+    for s1 in stage1_data:
+        job_idx = s1["job_index"]
+        job_key = s1["job_key"]
         for m_idx, m_ser in enumerate(s1.get("raw_mentions", [])):
             m = deserialize_mention(m_ser)
             pl = m.get("_parsed_line")
@@ -1747,23 +1682,39 @@ def run_pipeline(
     original_timing = cfg.llm_timing_callback
     cfg.llm_timing_callback = _timing_cb
 
-    # --- Stage 0: Preprocess ---
-    stats.record_stage_start("stage0_preprocessed")
-    stage0_data = _load_or_run_stage(
-        "stage0_preprocessed", ckpt_dir, run_id, resume, len(jobs),
-        run_fn=lambda start_idx=0: _run_stage0_preprocess(
-            jobs, cfg, run_id, ckpt_dir, progress_callback, start_idx=start_idx,
-        ),
-        progress_cb=progress_callback,
-    )
-    stats.record_stage_end("stage0_preprocessed")
+    # --- Stage 0: Preprocess (DISABLED) ---
+    # Stage 0 split each job description into individual lines (ParsedLine objects),
+    # labeled sections (e.g. "Requirements", "Qualifications"), classified boilerplate
+    # (legal/EEO/benefits), mined regex-based candidate spans as LLM hints, and
+    # assessed description quality. It produced structured data that stage 1 consumed
+    # in 5-line batches.
+    #
+    # Going away because: the LLM is capable of extracting skills from the full job
+    # description in a single call. The line-level preprocessing and batching added
+    # complexity (45K LLM calls for 10K jobs instead of 10K), increased failure
+    # surface (each HTTP call can timeout), and lost cross-line context within a job.
+    # Boilerplate filtering and candidate mining are unnecessary — the model handles
+    # raw text fine with 16K context.
+    #
+    # Stage 1 now works directly from raw jobs. Each mention carries a lightweight
+    # ParsedLine with section/context so stages 2-4 work unchanged.
+    #
+    # stats.record_stage_start("stage0_preprocessed")
+    # stage0_data = _load_or_run_stage(
+    #     "stage0_preprocessed", ckpt_dir, run_id, resume, len(jobs),
+    #     run_fn=lambda start_idx=0: _run_stage0_preprocess(
+    #         jobs, cfg, run_id, ckpt_dir, progress_callback, start_idx=start_idx,
+    #     ),
+    #     progress_cb=progress_callback,
+    # )
+    # stats.record_stage_end("stage0_preprocessed")
 
-    # --- Stage 1: Extract ---
+    # --- Stage 1: Extract (one LLM call per job) ---
     stats.record_stage_start("stage1_extracted")
     stage1_data = _load_or_run_stage(
-        "stage1_extracted", ckpt_dir, run_id, resume, len(stage0_data),
+        "stage1_extracted", ckpt_dir, run_id, resume, len(jobs),
         run_fn=lambda start_idx=0: _run_stage1_extract(
-            stage0_data, cfg, run_id, ckpt_dir, progress_callback, stats, start_idx=start_idx,
+            jobs, cfg, run_id, ckpt_dir, progress_callback, stats, start_idx=start_idx,
         ),
         progress_cb=progress_callback,
     )
@@ -1779,7 +1730,7 @@ def run_pipeline(
     stage2_data = _load_or_run_stage(
         "stage2_verified", ckpt_dir, run_id, resume, total_mentions,
         run_fn=lambda start_idx=0: _run_stage2_verify(
-            stage0_data, stage1_data, cfg, run_id, ckpt_dir, progress_callback, stats,
+            stage1_data, cfg, run_id, ckpt_dir, progress_callback, stats,
             start_idx=start_idx,
         ),
         progress_cb=progress_callback,
@@ -1791,7 +1742,7 @@ def run_pipeline(
     stage3_data = _load_or_run_stage(
         "stage3_requirement", ckpt_dir, run_id, resume, total_mentions,
         run_fn=lambda start_idx=0: _run_stage3_requirement(
-            stage0_data, stage1_data, stage2_data, cfg, run_id, ckpt_dir, progress_callback,
+            stage1_data, stage2_data, cfg, run_id, ckpt_dir, progress_callback,
             stats, start_idx=start_idx,
         ),
         progress_cb=progress_callback,
@@ -1803,7 +1754,7 @@ def run_pipeline(
     stage4_data = _load_or_run_stage(
         "stage4_hardsoft", ckpt_dir, run_id, resume, total_mentions,
         run_fn=lambda start_idx=0: _run_stage4_hardsoft(
-            stage0_data, stage1_data, stage2_data, cfg, run_id, ckpt_dir, progress_callback,
+            stage1_data, stage2_data, cfg, run_id, ckpt_dir, progress_callback,
             stats, start_idx=start_idx,
         ),
         progress_cb=progress_callback,
@@ -1813,7 +1764,7 @@ def run_pipeline(
     # --- Stage 5: Assemble ---
     stats.record_stage_start("stage5_assemble")
     augmented = _run_stage5_assemble(
-        jobs, stage0_data, stage1_data, stage2_data, stage3_data, stage4_data,
+        jobs, stage1_data, stage2_data, stage3_data, stage4_data,
         cfg, run_id, started,
     )
     stats.record_stage_end("stage5_assemble")
