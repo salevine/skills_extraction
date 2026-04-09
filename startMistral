@@ -16,8 +16,8 @@ mkdir -p "$TMPDIR" "$PIP_CACHE_DIR" ~/vllm-logs
 # -----------------------------
 MODEL="mistralai/Mistral-Nemo-Instruct-2407"
 HOST="127.0.0.1"
-BASE_PORT=8000
-START_GPU=0
+BASE_PORT=${2:-8000}
+START_GPU=${3:-0}
 MAX_MODEL_LEN=16384
 GPU_UTIL=0.90
 SLEEP_BETWEEN=5
@@ -26,8 +26,9 @@ SLEEP_BETWEEN=5
 # INPUT ARG
 # -----------------------------
 if [ $# -lt 1 ]; then
-  echo "Usage: $0 <num_gpus>"
-  echo "Example: $0 4"
+  echo "Usage: $0 <num_gpus> [base_port] [start_gpu]"
+  echo "Example: $0 4              # 4 workers, ports 8000-8003, GPUs 0-3"
+  echo "Example: $0 4 8004 4       # 4 workers, ports 8004-8007, GPUs 4-7"
   exit 1
 fi
 
