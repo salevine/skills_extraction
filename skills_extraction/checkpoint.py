@@ -111,18 +111,26 @@ def load_checkpoint(path: Path) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """
     meta: Dict[str, Any] = {}
     records: List[Dict[str, Any]] = []
+    skipped = 0
     with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
+        for line_num, line in enumerate(f, 1):
+            line = line.strip().replace("\x00", "")
             if not line:
                 continue
-            obj = json.loads(line)
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                skipped += 1
+                logger.warning("Skipping corrupt line %d in %s", line_num, path)
+                continue
             if obj.get("_meta"):
                 meta = obj
             elif obj.get("_complete"):
                 continue  # skip footer
             else:
                 records.append(obj)
+    if skipped:
+        logger.warning("Skipped %d corrupt line(s) in %s", skipped, path)
     return meta, records
 
 
