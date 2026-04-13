@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import re
 import threading
 import time
 from typing import Optional
@@ -21,6 +22,10 @@ _pool_endpoints: Optional[list] = None
 
 # Thread-local HTTP sessions — each thread reuses its own TCP connections
 _thread_local = threading.local()
+_reasoning_warned: set[tuple[str, str, str]] = set()
+_reasoning_warned_lock = threading.Lock()
+
+_THINK_BLOCK_RE = re.compile(r"^\s*<(?:think|thinking)>\s*.*?\s*</(?:think|thinking)>\s*", re.I | re.S)
 
 
 def _get_session() -> requests.Session:
@@ -31,6 +36,93 @@ def _get_session() -> requests.Session:
         session.headers.update({"Content-Type": "application/json"})
         _thread_local.session = session
     return session
+
+
+def _is_qwen_model(model: str) -> bool:
+    return "qwen" in (model or "").lower()
+
+
+def _append_no_think_suffix(text: str) -> str:
+    stripped = (text or "").rstrip()
+    if not stripped:
+        return "/no_think"
+    if stripped.splitlines()[-1].strip() == "/no_think":
+        return stripped
+    return f"{stripped}\n/no_think"
+
+
+def _build_vllm_payload(
+    cfg: PipelineConfig,
+    model: str,
+    system: str,
+    user: str,
+    temperature: float,
+) -> dict:
+    """Build the OpenAI-compatible payload for vLLM.
+
+    For Qwen, use both the documented request kwarg and the prompt-level
+    /no_think soft switch. Some server setups honor only one of the two.
+    """
+    user_text = user
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_text},
+        ],
+        "temperature": temperature,
+        "stream": False,
+    }
+    if cfg.disable_thinking and _is_qwen_model(model):
+        payload["messages"][1]["content"] = _append_no_think_suffix(user_text)
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+    return payload
+
+
+def _strip_leading_think_block(text: str) -> str:
+    cleaned = text or ""
+    while True:
+        next_text = _THINK_BLOCK_RE.sub("", cleaned, count=1)
+        if next_text == cleaned:
+            return cleaned
+        cleaned = next_text.lstrip()
+
+
+def _warn_reasoning_leak_once(endpoint: str, model: str, role: str) -> None:
+    key = (endpoint, model, role)
+    with _reasoning_warned_lock:
+        if key in _reasoning_warned:
+            return
+        _reasoning_warned.add(key)
+    logger.warning(
+        "vLLM returned reasoning output for %s on %s with disable_thinking enabled; "
+        "server-side Qwen settings may be ignoring the request-level no-think controls",
+        model,
+        endpoint,
+    )
+
+
+def _extract_vllm_content(
+    cfg: PipelineConfig,
+    endpoint: str,
+    model: str,
+    role: str,
+    data: dict,
+) -> str:
+    choices = data.get("choices", [])
+    if not choices:
+        raise ValueError("empty choices in vLLM response")
+    message = choices[0].get("message", {}) or {}
+    out = message.get("content", "")
+    reasoning = message.get("reasoning_content", "")
+    if cfg.disable_thinking and _is_qwen_model(model):
+        stripped = _strip_leading_think_block(out)
+        if stripped != out or reasoning:
+            _warn_reasoning_leak_once(endpoint, model, role)
+            out = stripped
+    if not out:
+        raise ValueError("empty content in vLLM response")
+    return out
 
 
 def _get_endpoint(cfg: PipelineConfig) -> str:
@@ -65,32 +157,14 @@ def call_vllm_direct(
     last_err: Optional[Exception] = None
     for attempt in range(cfg.vllm_max_retries):
         url = f"{endpoint}/chat/completions"
-        payload = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "temperature": temperature,
-            "stream": False,
-        }
-        # Disable Qwen3 thinking mode to avoid wasting tokens on reasoning.
-        # Only applied for Qwen models — other models (e.g. Mistral-Nemo)
-        # don't support this chat_template kwarg.
-        if cfg.disable_thinking and "qwen" in model.lower():
-            payload["chat_template_kwargs"] = {"enable_thinking": False}
+        payload = _build_vllm_payload(cfg, model, system, user, temperature)
         try:
             session = _get_session()
             t0 = time.perf_counter()
             r = session.post(url, json=payload, timeout=cfg.vllm_timeout_sec)
             r.raise_for_status()
             data = r.json()
-            choices = data.get("choices", [])
-            if not choices:
-                raise ValueError("empty choices in vLLM response")
-            out = choices[0].get("message", {}).get("content", "")
-            if not out:
-                raise ValueError("empty content in vLLM response")
+            out = _extract_vllm_content(cfg, endpoint, model, role, data)
             elapsed = time.perf_counter() - t0
             logger.debug("vLLM %s (%s) %.1fs", role, endpoint, elapsed)
             if getattr(cfg, "llm_timing_callback", None):
@@ -145,29 +219,14 @@ def call_vllm(
     for attempt in range(cfg.vllm_max_retries):
         endpoint = _get_endpoint(cfg)
         url = f"{endpoint}/chat/completions"
-        payload = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "temperature": temperature,
-            "stream": False,
-        }
-        if cfg.disable_thinking and "qwen" in model.lower():
-            payload["chat_template_kwargs"] = {"enable_thinking": False}
+        payload = _build_vllm_payload(cfg, model, system, user, temperature)
         try:
             session = _get_session()
             t0 = time.perf_counter()
             r = session.post(url, json=payload, timeout=cfg.vllm_timeout_sec)
             r.raise_for_status()
             data = r.json()
-            choices = data.get("choices", [])
-            if not choices:
-                raise ValueError("empty choices in vLLM response")
-            out = choices[0].get("message", {}).get("content", "")
-            if not out:
-                raise ValueError("empty content in vLLM response")
+            out = _extract_vllm_content(cfg, endpoint, model, role, data)
             elapsed = time.perf_counter() - t0
             _return_endpoint(endpoint)
             logger.debug("vLLM %s (%s) %.1fs", role, endpoint, elapsed)

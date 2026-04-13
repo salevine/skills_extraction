@@ -405,7 +405,67 @@ def test_thread_local_sessions():
 
 
 # ---------------------------------------------------------------------------
-# Test 8: _run_rolling bounds in-flight futures
+# Test 8: Qwen vLLM payload applies both no-think controls
+# ---------------------------------------------------------------------------
+
+def test_vllm_qwen_no_think_payload():
+    """Qwen on vLLM should get both the request kwarg and the prompt-level
+    /no_think suffix when disable_thinking is enabled."""
+    from skills_extraction.config import PipelineConfig
+    from skills_extraction.llm_vllm import _build_vllm_payload
+
+    cfg = PipelineConfig(backend="vllm", disable_thinking=True)
+    payload = _build_vllm_payload(
+        cfg,
+        "Qwen/Qwen3-14B",
+        "Return JSON only.",
+        "Extract skills from this description.",
+        0.1,
+    )
+
+    assert payload.get("chat_template_kwargs") == {"enable_thinking": False}, (
+        f"FAIL: missing Qwen chat_template_kwargs: {payload}"
+    )
+    user_text = payload["messages"][1]["content"]
+    assert user_text.endswith("\n/no_think"), (
+        f"FAIL: missing /no_think suffix in user payload: {user_text!r}"
+    )
+
+    payload_non_qwen = _build_vllm_payload(
+        cfg,
+        "mistralai/Mistral-Nemo-Instruct-2407",
+        "Return JSON only.",
+        "Extract skills from this description.",
+        0.1,
+    )
+    assert "chat_template_kwargs" not in payload_non_qwen, (
+        "FAIL: non-Qwen model should not receive Qwen thinking kwargs"
+    )
+    assert not payload_non_qwen["messages"][1]["content"].endswith("/no_think"), (
+        "FAIL: non-Qwen model should not receive /no_think suffix"
+    )
+    print("PASS: test_vllm_qwen_no_think_payload")
+
+
+# ---------------------------------------------------------------------------
+# Test 9: Leading think blocks are stripped before downstream parsing
+# ---------------------------------------------------------------------------
+
+def test_vllm_strip_leading_think_block():
+    """If vLLM still emits a leading <think> block, strip it so JSON parsing
+    consumes the final answer content."""
+    from skills_extraction.llm_vllm import _strip_leading_think_block
+
+    raw = "<think>\nlong reasoning\n</think>\n{\"mentions\":[]}"
+    cleaned = _strip_leading_think_block(raw)
+    assert cleaned == "{\"mentions\":[]}", (
+        f"FAIL: think block not stripped correctly: {cleaned!r}"
+    )
+    print("PASS: test_vllm_strip_leading_think_block")
+
+
+# ---------------------------------------------------------------------------
+# Test 10: _run_rolling bounds in-flight futures
 # ---------------------------------------------------------------------------
 
 def test_rolling_bounded():
@@ -492,7 +552,7 @@ def test_rolling_bounded():
 
 
 # ---------------------------------------------------------------------------
-# Test 9: Classifier role strings are distinct from verifier
+# Test 11: Classifier role strings are distinct from verifier
 # ---------------------------------------------------------------------------
 
 def test_classifier_role_strings():
@@ -521,7 +581,7 @@ def test_classifier_role_strings():
 
 
 # ---------------------------------------------------------------------------
-# Test 10: Zero-mention job counts as success, not failure
+# Test 12: Zero-mention job counts as success, not failure
 # ---------------------------------------------------------------------------
 
 def test_zero_mention_job_is_success():
@@ -574,7 +634,7 @@ def test_zero_mention_job_is_success():
 
 
 # ---------------------------------------------------------------------------
-# Test 11: Stage-1 extraction failure counts as failed job
+# Test 13: Stage-1 extraction failure counts as failed job
 # ---------------------------------------------------------------------------
 
 def test_stage1_error_job_is_failed():
@@ -620,7 +680,7 @@ def test_stage1_error_job_is_failed():
 
 
 # ---------------------------------------------------------------------------
-# Test 12: ParsedLine dedup in checkpoint serialization
+# Test 14: ParsedLine dedup in checkpoint serialization
 # ---------------------------------------------------------------------------
 
 def test_checkpoint_parsed_line_dedup():
@@ -664,7 +724,7 @@ def test_checkpoint_parsed_line_dedup():
 
 
 # ---------------------------------------------------------------------------
-# Test 13: Backward compat — old checkpoints with inline _parsed_line_dict
+# Test 15: Backward compat — old checkpoints with inline _parsed_line_dict
 # ---------------------------------------------------------------------------
 
 def test_checkpoint_backward_compat():
@@ -694,7 +754,7 @@ def test_checkpoint_backward_compat():
 
 
 # ---------------------------------------------------------------------------
-# Test 14: Batched flushing
+# Test 16: Batched flushing
 # ---------------------------------------------------------------------------
 
 def test_batched_flush():
@@ -731,7 +791,7 @@ def test_batched_flush():
 
 
 # ---------------------------------------------------------------------------
-# Test 15: Fingerprint mismatch invalidates checkpoint
+# Test 17: Fingerprint mismatch invalidates checkpoint
 # ---------------------------------------------------------------------------
 
 def test_fingerprint_mismatch_invalidates():
@@ -784,7 +844,7 @@ def test_fingerprint_mismatch_invalidates():
 
 
 # ---------------------------------------------------------------------------
-# Test 16: Missing fingerprint invalidates older checkpoint
+# Test 18: Missing fingerprint invalidates older checkpoint
 # ---------------------------------------------------------------------------
 
 def test_missing_fingerprint_invalidates():
@@ -824,7 +884,7 @@ def test_missing_fingerprint_invalidates():
 
 
 # ---------------------------------------------------------------------------
-# Test 17: Checkpoint total mismatch invalidates complete and partial resume
+# Test 19: Checkpoint total mismatch invalidates complete and partial resume
 # ---------------------------------------------------------------------------
 
 def test_checkpoint_total_mismatch_invalidates():
@@ -884,7 +944,7 @@ def test_checkpoint_total_mismatch_invalidates():
 
 
 # ---------------------------------------------------------------------------
-# Test 18: Fingerprint changes when model, prompt, or config changes
+# Test 20: Fingerprint changes when model, prompt, or config changes
 # ---------------------------------------------------------------------------
 
 def test_fingerprint_changes_with_model():
@@ -930,6 +990,8 @@ if __name__ == "__main__":
         ("test_context_match_preferred", test_context_match_preferred),
         ("test_offsets_match_normalized", test_offsets_match_normalized),
         ("test_thread_local_sessions", test_thread_local_sessions),
+        ("test_vllm_qwen_no_think_payload", test_vllm_qwen_no_think_payload),
+        ("test_vllm_strip_leading_think_block", test_vllm_strip_leading_think_block),
         ("test_rolling_bounded", test_rolling_bounded),
         ("test_classifier_role_strings", test_classifier_role_strings),
         ("test_zero_mention_job_is_success", test_zero_mention_job_is_success),

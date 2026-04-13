@@ -82,7 +82,7 @@ class PipelineConfig:
     quality_complete_min_score: float = 0.45
 
     # Pipeline
-    pipeline_version: str = "3.4.0"
+    pipeline_version: str = "3.4.1"
     skip_llm: bool = False  # for tests: candidates only
     disable_thinking: bool = True  # append /no_think to suppress qwen3 thinking mode
     checkpoint_flush_interval: int = 16  # flush checkpoint every N records (1=every record)
