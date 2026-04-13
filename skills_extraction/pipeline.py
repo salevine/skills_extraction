@@ -21,7 +21,6 @@ from .checkpoint import (
     checkpoint_complete,
     checkpoint_path,
     compute_stage_fingerprint,
-    count_checkpoint_records,
     deserialize_candidate,
     deserialize_mentions_for_job,
     deserialize_parsed_line,
@@ -1365,15 +1364,16 @@ def _load_or_run_stage(
             ckpt_total = meta.get("total_jobs", 0)
             if ckpt_total != total_expected:
                 logger.warning(
-                    "Checkpoint %s has %d records but expected %d jobs; ignoring checkpoint",
+                    "Checkpoint %s has %d records but expected %d jobs; rerunning from scratch",
                     stage_name, ckpt_total, total_expected,
                 )
+                return run_fn(start_idx=0)
             else:
                 logger.info("Stage %s: loading complete checkpoint (%d records)", stage_name, len(records))
                 return records
 
         # Partial checkpoint -- check fingerprint before resuming
-        meta_partial, _ = load_checkpoint(path)
+        meta_partial, records_partial = load_checkpoint(path)
         ckpt_fp = meta_partial.get("fingerprint")
         if fingerprint and ckpt_fp != fingerprint:
             logger.warning(
@@ -1383,7 +1383,16 @@ def _load_or_run_stage(
             )
             return run_fn(start_idx=0)
 
-        existing = count_checkpoint_records(path)
+        ckpt_total = meta_partial.get("total_jobs", 0)
+        if ckpt_total and ckpt_total != total_expected:
+            logger.warning(
+                "Partial checkpoint %s has %d records expected but current run expects %d; "
+                "rerunning from scratch",
+                stage_name, ckpt_total, total_expected,
+            )
+            return run_fn(start_idx=0)
+
+        existing = len(records_partial)
         if existing > 0:
             logger.info("Stage %s: resuming from record %d", stage_name, existing)
             return run_fn(start_idx=existing)
@@ -1853,24 +1862,28 @@ def run_pipeline(
         "stage1", cfg.extractor_model, cfg.backend,
         [EXTRACTOR_V2_SYSTEM, EXTRACTOR_V2_USER_TEMPLATE],
         pipeline_version=cfg.pipeline_version,
+        extra_settings={"disable_thinking": cfg.disable_thinking},
     )
     fp_s2 = compute_stage_fingerprint(
         "stage2", cfg.verifier_model, cfg.backend,
         [SKILL_VERIFIER_SYSTEM, SKILL_VERIFIER_USER_TEMPLATE],
         upstream_fingerprint=fp_s1,
         pipeline_version=cfg.pipeline_version,
+        extra_settings={"disable_thinking": cfg.disable_thinking},
     )
     fp_s3 = compute_stage_fingerprint(
         "stage3", cfg.requirement_model, cfg.backend,
         [REQUIREMENT_CLASSIFIER_SYSTEM, REQUIREMENT_CLASSIFIER_USER_TEMPLATE],
         upstream_fingerprint=fp_s2,
         pipeline_version=cfg.pipeline_version,
+        extra_settings={"disable_thinking": cfg.disable_thinking},
     )
     fp_s4 = compute_stage_fingerprint(
         "stage4", cfg.hardsoft_model, cfg.backend,
         [HARDSOFT_CLASSIFIER_SYSTEM, HARDSOFT_CLASSIFIER_USER_TEMPLATE],
         upstream_fingerprint=fp_s2,
         pipeline_version=cfg.pipeline_version,
+        extra_settings={"disable_thinking": cfg.disable_thinking},
     )
 
     # Store fingerprints so stage functions can embed them in checkpoint headers

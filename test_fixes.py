@@ -824,11 +824,72 @@ def test_missing_fingerprint_invalidates():
 
 
 # ---------------------------------------------------------------------------
-# Test 17: Fingerprint changes when model or user prompt changes
+# Test 17: Checkpoint total mismatch invalidates complete and partial resume
+# ---------------------------------------------------------------------------
+
+def test_checkpoint_total_mismatch_invalidates():
+    """A checkpoint for a different total job count must rerun from scratch
+    instead of loading or resuming from the wrong index."""
+    import tempfile, shutil
+    from pathlib import Path
+    from skills_extraction.pipeline import _load_or_run_stage
+    from skills_extraction.checkpoint import (
+        append_checkpoint_record, checkpoint_path, write_checkpoint_footer, write_checkpoint_header,
+    )
+
+    tmpdir = Path(tempfile.mkdtemp())
+    try:
+        ckpt_dir = tmpdir / "checkpoints"
+        ckpt_dir.mkdir()
+        path = checkpoint_path(tmpdir, "test_run", "test_stage")
+
+        # Complete checkpoint with wrong total
+        with open(path, "w") as fh:
+            write_checkpoint_header(fh, "test_run", "test_stage", 2, fingerprint="FP1")
+            append_checkpoint_record(fh, {"idx": 0, "data": "old"})
+            append_checkpoint_record(fh, {"idx": 1, "data": "old"})
+            write_checkpoint_footer(fh, 2)
+
+        run_args = []
+        def _run_complete(start_idx=0):
+            run_args.append(start_idx)
+            return [{"idx": 0, "data": "new"}]
+
+        result = _load_or_run_stage(
+            "test_stage", ckpt_dir, "test_run", resume=True, total_expected=3,
+            run_fn=_run_complete, fingerprint="FP1",
+        )
+        assert run_args == [0], f"FAIL: complete total mismatch should rerun from 0, got {run_args}"
+        assert result[0]["data"] == "new"
+
+        # Partial checkpoint with wrong total
+        with open(path, "w") as fh:
+            write_checkpoint_header(fh, "test_run", "test_stage", 2, fingerprint="FP1")
+            append_checkpoint_record(fh, {"idx": 0, "data": "partial"})
+
+        run_args.clear()
+        def _run_partial(start_idx=0):
+            run_args.append(start_idx)
+            return [{"idx": 0, "data": "new"}]
+
+        result = _load_or_run_stage(
+            "test_stage", ckpt_dir, "test_run", resume=True, total_expected=3,
+            run_fn=_run_partial, fingerprint="FP1",
+        )
+        assert run_args == [0], f"FAIL: partial total mismatch should rerun from 0, got {run_args}"
+        assert result[0]["data"] == "new"
+        print("PASS: test_checkpoint_total_mismatch_invalidates")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+# ---------------------------------------------------------------------------
+# Test 18: Fingerprint changes when model, prompt, or config changes
 # ---------------------------------------------------------------------------
 
 def test_fingerprint_changes_with_model():
-    """Changing the model name or prompt text must produce a different fingerprint."""
+    """Changing the model name, prompt text, or config input must produce a
+    different fingerprint."""
     from skills_extraction.checkpoint import compute_stage_fingerprint
 
     fp1 = compute_stage_fingerprint("stage1", "qwen3:14b", "vllm", ["prompt text"])
@@ -836,10 +897,19 @@ def test_fingerprint_changes_with_model():
     fp3 = compute_stage_fingerprint("stage1", "qwen3:14b", "vllm", ["different prompt"])
     fp4 = compute_stage_fingerprint("stage2", "mistral-nemo:12b", "vllm", ["system", "user v1"])
     fp5 = compute_stage_fingerprint("stage2", "mistral-nemo:12b", "vllm", ["system", "user v2"])
+    fp6 = compute_stage_fingerprint(
+        "stage1", "qwen3:14b", "vllm", ["prompt text"],
+        extra_settings={"disable_thinking": True},
+    )
+    fp7 = compute_stage_fingerprint(
+        "stage1", "qwen3:14b", "vllm", ["prompt text"],
+        extra_settings={"disable_thinking": False},
+    )
 
     assert fp1 != fp2, "FAIL: different models should produce different fingerprints"
     assert fp1 != fp3, "FAIL: different prompts should produce different fingerprints"
     assert fp4 != fp5, "FAIL: different user templates should produce different fingerprints"
+    assert fp6 != fp7, "FAIL: different config settings should produce different fingerprints"
     # Same inputs should be deterministic
     fp1b = compute_stage_fingerprint("stage1", "qwen3:14b", "vllm", ["prompt text"])
     assert fp1 == fp1b, "FAIL: same inputs should produce same fingerprint"
@@ -869,6 +939,7 @@ if __name__ == "__main__":
         ("test_batched_flush", test_batched_flush),
         ("test_fingerprint_mismatch_invalidates", test_fingerprint_mismatch_invalidates),
         ("test_missing_fingerprint_invalidates", test_missing_fingerprint_invalidates),
+        ("test_checkpoint_total_mismatch_invalidates", test_checkpoint_total_mismatch_invalidates),
         ("test_fingerprint_changes_with_model", test_fingerprint_changes_with_model),
     ]
 

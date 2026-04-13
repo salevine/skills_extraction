@@ -30,12 +30,14 @@ def compute_stage_fingerprint(
     prompt_texts: List[str],
     upstream_fingerprint: Optional[str] = None,
     pipeline_version: str = "",
+    extra_settings: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Compute a short hash fingerprint for a pipeline stage.
 
     Inputs: model name, backend, system+user prompt templates, upstream
-    stage fingerprint (for chaining), and pipeline version. Returns an
-    8-char hex digest. A change in any input produces a different fingerprint,
+    stage fingerprint (for chaining), pipeline version, and selected
+    behavior-changing config values. Returns a 16-char hex digest.
+    A change in any input produces a different fingerprint,
     causing checkpoint invalidation on resume.
     """
     h = hashlib.sha256()
@@ -47,6 +49,10 @@ def compute_stage_fingerprint(
         h.update(pt.encode())
     if upstream_fingerprint:
         h.update(f"upstream={upstream_fingerprint}\n".encode())
+    if extra_settings:
+        for key in sorted(extra_settings):
+            value = json.dumps(extra_settings[key], ensure_ascii=False, sort_keys=True)
+            h.update(f"{key}={value}\n".encode())
     return h.hexdigest()[:16]
 
 
