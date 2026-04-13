@@ -48,6 +48,6 @@ if ($args -contains "-s") {
 
 # Keep backward-compatible root entry points on the server.
 Write-Host "Linking root launchers..."
-ssh $Server "ln -sf $Remote/startQwen ~/startQwen && chmod +x $Remote/startQwen $Remote/startQwen.sh $Remote/startMistral $Remote/stopModel $Remote/check_status.sh $Remote/resumeMistral.sh $Remote/vLLM_run.sh $Remote/test_vllm.sh $Remote/full_run.sh"
+ssh $Server "find $Remote -maxdepth 1 \( -name '*.sh' -o -name 'startQwen' -o -name '*.jinja' \) -type f -exec sed -i 's/\r$//' {} + && ln -sf $Remote/startQwen ~/startQwen && chmod +x $Remote/startQwen $Remote/startQwen.sh $Remote/startMistral $Remote/stopModel $Remote/check_status.sh $Remote/resumeMistral.sh $Remote/vLLM_run.sh $Remote/test_vllm.sh $Remote/full_run.sh"
 
 Write-Host "Deploy complete."
