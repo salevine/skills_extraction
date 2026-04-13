@@ -5,8 +5,7 @@
 #   tail -f run.log
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+cd ~/skills_extraction
 
 echo "=== Full pipeline run — $(date) ==="
 
@@ -52,11 +51,11 @@ echo "=== Swapping to Mistral-Nemo ==="
 # ------------------------------------------------------------------
 # Swap models
 # ------------------------------------------------------------------
-"$SCRIPT_DIR/stopModel"
+~/stopModel
 echo "Waiting for Qwen to shut down..."
 sleep 10
 
-"$SCRIPT_DIR/startMistral" 8
+~/startMistral 8
 echo "Waiting for Mistral-Nemo to load..."
 # Poll until ready
 for i in $(seq 1 60); do
@@ -98,4 +97,4 @@ echo "=== Pipeline complete — $(date) ==="
 echo "=== Run ID: $RUN_ID ==="
 
 # Show status
-"$SCRIPT_DIR/check_status.sh" "$RUN_ID"
+./check_status.sh "$RUN_ID" 2>/dev/null || true
