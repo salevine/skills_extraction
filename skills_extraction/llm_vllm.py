@@ -19,6 +19,19 @@ _endpoint_pool: Optional[queue.Queue] = None
 _pool_lock: threading.Lock = threading.Lock()
 _pool_endpoints: Optional[list] = None
 
+# Thread-local HTTP sessions — each thread reuses its own TCP connections
+_thread_local = threading.local()
+
+
+def _get_session() -> requests.Session:
+    """Return a per-thread persistent session (created once per thread)."""
+    session = getattr(_thread_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.headers.update({"Content-Type": "application/json"})
+        _thread_local.session = session
+    return session
+
 
 def _get_endpoint(cfg: PipelineConfig) -> str:
     """Block until an endpoint is available and return it (checkout)."""
@@ -67,13 +80,9 @@ def call_vllm_direct(
         if cfg.disable_thinking and "qwen" in model.lower():
             payload["chat_template_kwargs"] = {"enable_thinking": False}
         try:
+            session = _get_session()
             t0 = time.perf_counter()
-            r = requests.post(
-                url,
-                json=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=cfg.vllm_timeout_sec,
-            )
+            r = session.post(url, json=payload, timeout=cfg.vllm_timeout_sec)
             r.raise_for_status()
             data = r.json()
             choices = data.get("choices", [])
@@ -86,8 +95,8 @@ def call_vllm_direct(
             logger.debug("vLLM %s (%s) %.1fs", role, endpoint, elapsed)
             if getattr(cfg, "llm_timing_callback", None):
                 cfg.llm_timing_callback(model, elapsed, role)
-            if cfg.per_call_delay_sec:
-                time.sleep(cfg.per_call_delay_sec)
+            if cfg.vllm_per_call_delay_sec:
+                time.sleep(cfg.vllm_per_call_delay_sec)
             return out
         except Exception as e:
             last_err = e
@@ -121,13 +130,9 @@ def call_vllm(
         if cfg.disable_thinking and "qwen" in model.lower():
             payload["chat_template_kwargs"] = {"enable_thinking": False}
         try:
+            session = _get_session()
             t0 = time.perf_counter()
-            r = requests.post(
-                url,
-                json=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=cfg.vllm_timeout_sec,
-            )
+            r = session.post(url, json=payload, timeout=cfg.vllm_timeout_sec)
             r.raise_for_status()
             data = r.json()
             choices = data.get("choices", [])
@@ -141,8 +146,8 @@ def call_vllm(
             logger.debug("vLLM %s (%s) %.1fs", role, endpoint, elapsed)
             if getattr(cfg, "llm_timing_callback", None):
                 cfg.llm_timing_callback(model, elapsed, role)
-            if cfg.per_call_delay_sec:
-                time.sleep(cfg.per_call_delay_sec)
+            if cfg.vllm_per_call_delay_sec:
+                time.sleep(cfg.vllm_per_call_delay_sec)
             return out
         except Exception as e:
             last_err = e

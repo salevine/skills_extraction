@@ -1,6 +1,6 @@
-# Skills extraction (v2)
+# Skills extraction
 
-Open-vocabulary, line-level, audit-first **skill mention extraction** from job postings using **Ollama**.
+Open-vocabulary, mention-level **skill extraction** from job postings with multi-backend LLM support (**Ollama**, **vLLM**, **OpenRouter**).
 
 ## Quick start
 
@@ -34,7 +34,7 @@ python Runskills_extraction.py --input your_jobs.json --output-dir ./out --sampl
 ## Requirements
 
 - Python 3.10+
-- Running **Ollama** (local or remote) with your chosen models pulled
+- One configured backend: **Ollama**, **vLLM**, or **OpenRouter**
 
 ## License
 

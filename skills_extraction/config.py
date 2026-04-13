@@ -63,6 +63,7 @@ class PipelineConfig:
     vllm_num_endpoints: int = 8
     vllm_max_retries: int = 3
     vllm_timeout_sec: int = 300
+    vllm_per_call_delay_sec: float = 0.0  # no artificial delay for vLLM by default
 
     # Line batching for LLM
     extractor_batch_max_lines: int = 5
@@ -81,7 +82,7 @@ class PipelineConfig:
     quality_complete_min_score: float = 0.45
 
     # Pipeline
-    pipeline_version: str = "3.2.0"
+    pipeline_version: str = "3.3.0"
     skip_llm: bool = False  # for tests: candidates only
     disable_thinking: bool = True  # append /no_think to suppress qwen3 thinking mode
 

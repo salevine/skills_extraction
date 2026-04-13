@@ -1,9 +1,16 @@
 # Skills extraction (v3) — full guide
 
-Open-vocabulary, **line-level**, **audit-first** skill mention extraction with multi-backend LLM support (Ollama, vLLM, OpenRouter).
+Open-vocabulary, mention-level skill extraction with multi-backend LLM support (Ollama, vLLM, OpenRouter).
 The **source of truth** is **mention-level** JSON (plus JSONL/CSV exports). Summary reports are **derived**, not primary.
 
-**Current release: 3.2.1** (see **`CHANGELOG.md`** for full history). Highlights: **multi-backend architecture** (Ollama / vLLM / OpenRouter), **concurrent multi-GPU extraction** via vLLM with batch-level parallelism, **thinking-mode suppression** for Qwen3, **stage-first pipeline** with intermediate checkpoints and crash-recovery resume, and **server deployment tooling** for remote vLLM clusters.
+This README is written to match the **current default code path** in `cli.py -> run_pipeline()`, not just the older design docs. See **`CHANGELOG.md`** for version history.
+
+## Current status
+
+- **Default execution path:** `run_pipeline()` runs **whole-job extraction** in stage 1, then mention-level verification / requirement / hard-soft passes in stages 2-4. Stages 2-4 are **authoritative** — their results override stage-1 extractor classifications in the final assembly.
+- **Source grounding:** Stage-1 mentions are anchored to real `ParsedLine` objects from the preprocessed source text (sectioned, boilerplate-labeled). The preprocessing/sectioning/boilerplate modules are now exercised on the default hot path for grounding, not just the legacy `process_single_job()` path.
+- **Scaled backend path:** vLLM is the primary production backend. Stage 1 uses direct endpoint assignment per job; stages 2-4 use a rolling worker pool with bounded submission for continuous throughput.
+- **Offset reference text:** `char_start`/`char_end` on mentions index into `description_normalized` (whitespace-collapsed, section-split). Both `description_raw` and `description_normalized` are exported in the augmented output.
 
 ---
 
@@ -11,21 +18,21 @@ The **source of truth** is **mention-level** JSON (plus JSONL/CSV exports). Summ
 
 Job postings are messy. They mix real requirements with legal boilerplate, perks, and vague “we’re a family” fluff. They also don’t come with a neat list of skills—you have to *read* them. This application is a **pipeline** that takes a collection of job records (usually JSON), pulls out the **description text**, and tries to surface **what the employer is actually asking for** in terms of tools, technologies, methods, and competencies—without forcing everything into a fixed skill taxonomy up front.
 
-**NLP side of the house.** The system doesn’t just “send the whole blob to the model and hope.” It does a fair bit of classical, transparent text work first. Descriptions are **normalized** (consistent newlines, a stable string the rest of the pipeline agrees on) so that **character offsets** mean something—you can point back to exactly where a mention lived in the text. The document is **split into lines** and given simple **section cues** (things like requirements vs. narrative) so later stages know *where* in the posting a span appeared. There’s a **document-quality pass** that looks at signals like repetition, how “skill-ish” the lines feel, and how much looks like filler; the goal isn’t to be preachy about bad ads, but to **flag** thin or broken text so you don’t over-trust extractions from garbage inputs. Each line also gets a **boilerplate label**—legal, benefits, marketing, **uncertain** (default for narrative), or **skills_relevant** only when **lexical** skill/requirement cues appear—so fewer generic body lines flood the extractor.
+**NLP side of the house.** The classical text-processing stack (description normalization, inline section splitting, line segmentation, boilerplate labeling) is now used on the default hot path for **mention grounding**: after stage 1 extracts spans from the full raw description, each mention is anchored to a real `ParsedLine` with accurate section labels, boilerplate classification, and character offsets into the normalized text. Quality scoring and candidate mining remain in the repo but are only exercised by the legacy `process_single_job()` path.
 
-**Finding candidates before the LLM.** **Deterministic pattern mining** (experience / must-have / preferred / strong “skills” phrases, etc.) plus **gated** list-like tokens: comma-separated “tool-ish” candidates run mainly in **requirement-leaning sections** or lines that already look skill-related, with a **stoplist** for generic words. Goal: **enough recall** for real requirements without stuffing the prompt with narrative junk.
+**Finding candidates before the LLM.** Deterministic candidate mining is still implemented in `candidate_mining.py`, but it is currently part of the **legacy / support path**, not the default `run_pipeline()` hot path.
 
-**Where the large language model fits in.** The LLM flow is now **role-specialized by stage**. First, the extractor proposes candidate spans only (with evidence and `span_confidence`). Second, a skill verifier decides whether each span is truly a skill mention. Third and fourth stages classify accepted mentions as `required|optional|unclear` and `hard|soft|unknown`. This keeps each stage narrow, improves auditability, and makes failures easier to localize. Parse failures are recorded stage-by-stage (`parse_failed`) with penalties in final confidence and visibility in exports.
+**Where the large language model fits in.** In the current default flow, stage 1 does a **whole-job extraction** and returns exact spans plus model-supplied context / section / classification fields. Each mention is then grounded to a real source line. Stages 2-4 operate at the **mention level**: skill verification, requirement classification, and hard-vs-soft classification. Stages 2-4 are **authoritative** — if the verifier rejects a mention, it stays rejected regardless of what the extractor said. Extractor-supplied classifications are preserved in the audit trail but only used as fallback when a later stage was skipped.
 
-**Confidence scores.** Each mention gets a final confidence between 0 and 1, blended from multiple stage outputs and deterministic checks. Extractor + verifier remain the base blend (when verifier output is valid), and requirement/hard-soft classifier confidences are incorporated as secondary signals. Section boosts, rule-support boosts, and penalties for boilerplate context, invalid offsets/evidence, and stage parse failures/errors still apply.
+**Confidence scores.** Each mention gets a final confidence between 0 and 1, blended from stage outputs and deterministic checks. Extractor + verifier remain the base blend (when verifier output is valid), and requirement / hard-soft classifier confidences are incorporated as secondary signals. Section boosts and penalties for parse failures, stage errors, invalid offsets, and weak evidence all apply. Because mentions are now grounded to real source lines with accurate `boilerplate_label` values, boilerplate penalties (legal, benefits, marketing) fire correctly on the default path.
 
-*Example: high confidence.* A line reads “Required: 5+ years experience with Python and SQL.” The span “Python” appears in the “requirements” section, was mined by both the “experience with” and “must have” patterns, and the model returns it with 0.88. Boilerplate is “skills_relevant”, offsets are valid, evidence matches. Final score: 0.88 + 0.06 (section) + 0.05 (two rules) → **0.99**.
+*Example: high confidence.* A mention appears in a requirements-style context, survives verification, and receives strong agreement-level confidence from the later classifiers. That kind of staged agreement pushes the final score toward the top of the range.
 
-*Example: low confidence.* A line reads “We are an equal opportunity employer.” The model, overeager, suggests “employer” as a skill with 0.62. No patterns fired (it’s LLM-only), the line is labeled “likely_legal”, and the span’s offsets are slightly off. Final score: 0.62 − 0.14 (boilerplate) − 0.12 (bad offsets) → **0.36**.
+*Example: low confidence.* A mention is rejected by the verifier, or survives only through parse failures / weak evidence with poor offsets. Those cases are explicitly penalized and drop into the review bucket.
 
-**What you get out.** Every original job field is **preserved**; new fields are **appended** so you keep an audit trail: normalized text, per-line parses, candidates, mentions with offsets, quality metadata, and run info. From there you can export **JSONL/CSV** for stats or modeling, plus optional **summary reports** (quality overview, skill-ish frequency tables, a queue of low-confidence items for human spot checks). You can also run with **`--skip-llm`** to exercise the whole structural and mining stack without calling Ollama—handy for debugging or when you only want segmentation and candidates.
+**What you get out.** Every original job field is **preserved**; new fields are **appended** so you keep an audit trail. In the current default pipeline, the main appended outputs are `description_raw`, `description_normalized`, `skill_mentions`, `pipeline_stage_audit`, and `extraction_metadata`. Mention `char_start`/`char_end` offsets index into `description_normalized`. Mention exports (`JSONL` / `CSV`) and optional derived reports are written from that augmented output. The richer structural fields (`parsed_lines`, `skill_candidates`, `quality_assessment`) still exist in the codebase but are mainly produced by the legacy `process_single_job()` path.
 
-Think of it as a **hybrid extraction system** for unstructured job ads: linguistic preprocessing and line-level segmentation, rule-based candidate generation, and generative span labeling with optional verification and multi-factor confidence, aimed at reproducible, mention-level outputs suitable for labor-market or skills research—without pretending the model is infallible or that every posting is equally informative.
+Think of it as a **hybrid extraction system** for unstructured job ads: a whole-document LLM extraction pass grounded to real source structure, followed by staged mention-level adjudication where later stages are authoritative over the initial extractor.
 
 ---
 
@@ -70,12 +77,12 @@ skills-extraction/             # repository root
     cli.py                     # argparse + logging setup + progress display
     config.py                  # PipelineConfig, backend selection, env loading
     schemas.py
-    pipeline.py                # stage orchestration, windowed parallel execution
+    pipeline.py                # stage orchestration, rolling parallel execution
     llm_backend.py             # unified LLM dispatcher
     llm_ollama.py              # Ollama client
     llm_vllm.py                # vLLM client (pool + direct endpoint modes)
     llm_openrouter.py          # OpenRouter client
-    llm_extractor.py           # batched span extraction
+    llm_extractor.py           # whole-job extractor + deprecated batched helpers
     checkpoint.py              # checkpoint save/load/resume
     ... (other modules)
     README.md                  # this file
@@ -131,6 +138,7 @@ The pipeline supports three LLM backends, selected via `--backend` or `SKILLS_BA
 - Fallback if extractor batch fails: `llama3.1:8b`
 - Remote Ollama default: `http://ollama.rs.gsu.edu` (override with `--local` → `http://localhost:11434`)
 - Thinking-mode suppression: enabled by default (`disable_thinking: True`)
+- vLLM per-call delay: `0.0` (no artificial throttling); Ollama/OpenRouter: `0.25s`
 
 ---
 
@@ -153,7 +161,7 @@ python -m skills_extraction [OPTIONS]
 | `--no-verifier` | Disable the verifier LLM pass. |
 | `--no-requirement-classifier` | Disable requirement classifier pass. |
 | `--no-hardsoft-classifier` | Disable hard/soft classifier pass. |
-| `--skip-llm` | No LLM calls: structure, `parsed_lines`, `skill_candidates`, quality only. |
+| `--skip-llm` | Legacy/debug flag. The richest no-LLM structural output is still on the older `process_single_job()` path; the default stage-first pipeline is centered on stage-1 extraction. |
 | `--no-reports` | Skip derived quality/frequency/low-confidence reports. |
 | `--no-resume` | Ignore existing checkpoints; overwrite from scratch. |
 | `--batch-lines` | Max lines per extractor request (default `5`). |
@@ -210,22 +218,17 @@ python Runskills_extraction.py -i SampleJobs.json -o ./out --sample 10
 
 ---
 
-## Pipeline stages (high level)
+## Pipeline stages (default `run_pipeline()` path)
 
 1. **Ingest** — Load JSON; preserve original keys; stable `job_key`.
-2. **Preprocess** — Keep `description_raw`; build `description_normalized` (includes **inline section header splits** so offsets match stored text).
-3. **Section + lines** — `line_id`, section heuristics (standalone + colon-led headers), char ranges.
-4. **Quality** — Multi-signal score + status; **missing description** → malformed (no company/location stand-in).
-5. **Boilerplate** — Per-line label; **conservative** promotion to `skills_relevant`.
-6. **Candidate mining** — Rule/pattern spans; **precision-tuned** list/prep rules (not line-wide noise).
-7. **LLM span extractor** — Batched lines + candidates → candidate span mentions; **offset repair** (valid model span → nearest match → evidence-aligned).
-8. **LLM skill verifier** — Validates each candidate as skill/not-skill; parse failures flagged explicitly.
-9. **LLM requirement classifier** — Assigns `required|optional|unclear` for validated mentions.
-10. **LLM hard/soft classifier** — Assigns `hard|soft|unknown` for validated mentions.
-11. **Confidence** — Combine extractor/verifier/classifier confidence signals plus section/rule/boilerplate/offset checks.
-12. **Export** — Augmented JSON, JSONL, CSV, optional reports (with stage audit fields).
+2. **Stage 1 extract** — Send each full job description to the extractor in one LLM call. Mentions are grounded to real `ParsedLine` objects from the preprocessed source text.
+3. **Stage 2 verify** — Validate each extracted mention as skill / not-skill. **Authoritative** — overrides extractor `is_skill`.
+4. **Stage 3 requirement** — Classify accepted mentions as `required|optional|unclear`. **Authoritative** — overrides extractor `requirement_level`.
+5. **Stage 4 hard/soft** — Classify accepted mentions as `hard|soft|unknown`. **Authoritative** — overrides extractor `hard_soft`.
+6. **Stage 5 assemble** — Merge per-stage outputs into final mention rows plus job-level audit metadata. Extractor classifications preserved in audit trail.
+7. **Export** — Augmented JSON, JSONL, CSV, optional reports, and `run_summary.json`.
 
-Details live in the module table below and in source docstrings.
+**Legacy path still in code:** preprocessing, sectioning, boilerplate labeling, quality scoring, and candidate mining remain implemented and are still exercised by `process_single_job()`, but stage 0 is currently disabled in the default stage-first orchestration.
 
 ---
 
@@ -244,23 +247,29 @@ Written under `--output-dir`:
 | `SkillsExtraction_low_confidence_run_{run_id}.json` | Unless `--no-reports` (includes `parse_failed`). |
 | `SkillsExtraction_run_summary_{run_id}.json` | Timing, models, job counts (CLI runs). |
 
+Under the current default stage-first flow, the mention exports and run summary are the primary artifacts. The augmented JSON now includes `description_normalized` and source-grounded mention offsets. Reports that depend on per-line structural metadata (parsed lines, candidates) are still thinner than in the legacy single-job path.
+
 ---
 
 ## Augmented job record (fields added)
 
-Original fields are **never removed**. New fields include:
+Original fields are **never removed**. In the current default stage-first pipeline, new fields include:
 
 | Field | Role |
 |-------|------|
-| `description_normalized` | Reference string for global `char_start` / `char_end`. |
-| `quality_assessment` | `status`, `quality_score`, `reasons`, `features`. |
-| `parsed_lines` | Line-level audit: `line_id`, `section`, `text`, offsets, `boilerplate_label`. |
-| `skill_candidates` | All mined spans (no early dedupe). |
-| `skill_mentions` | Mention-level staged outputs (`verifier_*`, `requirement_*`, `hardsoft_*`) and per-mention `pipeline_audit` with per-stage status/model/output/error. |
+| `description_raw` | Raw job description copied into the augmentation block. |
+| `description_normalized` | Whitespace-normalized, section-split text. Mention `char_start`/`char_end` index into this string. |
+| `skill_mentions` | Mention-level staged outputs (`verifier_*`, `requirement_*`, `hardsoft_*`) and per-mention `pipeline_audit` with per-stage status/model/output/error. Extractor's original classifications are preserved in `pipeline_audit.extractor.output` for traceability. |
 | `pipeline_stage_audit` | Job-level counters for stage failures/rejections and model snapshot for audit/debug. |
 | `extraction_metadata` | `run_id`, `pipeline_version`, models, timestamps, `job_key`. |
 
-**Example:** see `example_augmented_job_fragment.json` in this directory.
+The richer structural fields below still exist in the legacy single-job path and helper modules, but are **not currently appended by default `run_pipeline()`**:
+
+- `quality_assessment`
+- `parsed_lines`
+- `skill_candidates`
+
+**Example:** see `example_augmented_job_fragment.json` in this directory. That fragment reflects the older richer augmentation shape; the current default output includes `description_normalized` but not parsed lines or candidates.
 
 ---
 
@@ -349,20 +358,20 @@ Thinking-mode suppression (`disable_thinking: True`, the default) sends `chat_te
 | `sectioning.py` | Lines + section labels |
 | `boilerplate.py` | Line-level boilerplate classification |
 | `quality.py` | Document quality scoring |
-| `candidate_mining.py` | Pattern-based candidate spans |
+| `candidate_mining.py` | Pattern-based candidate spans for the legacy/support path |
 | `llm_backend.py` | Unified dispatcher — routes to Ollama / vLLM / OpenRouter |
 | `llm_ollama.py` | Ollama HTTP client + JSON repair |
-| `llm_vllm.py` | vLLM OpenAI-compatible client, endpoint pool, `call_vllm_direct()` |
+| `llm_vllm.py` | vLLM OpenAI-compatible client, endpoint pool, `call_vllm_direct()`, per-thread session reuse |
 | `llm_openrouter.py` | OpenRouter HTTP client |
 | `prompts.py` | Stage-specific prompt text (extract/verify/classify) |
-| `llm_extractor.py` | Batched span extraction (supports direct endpoint assignment) |
+| `llm_extractor.py` | Whole-job extraction plus deprecated batched extraction helpers |
 | `llm_verifier.py` | Skill verifier stage |
 | `llm_requirement_classifier.py` | Requirement classifier stage |
 | `llm_hardsoft_classifier.py` | Hard/soft classifier stage |
 | `confidence.py` | Final confidence blending |
 | `checkpoint.py` | Checkpoint save/load, resume logic, serialization |
 | `exporters.py` | JSON / JSONL / CSV / reports |
-| `pipeline.py` | Orchestration, windowed parallel execution |
+| `pipeline.py` | Orchestration, rolling worker pool, incremental checkpointing |
 | `run_stats.py` | Run timing / LLM stats for logs and `run_summary` JSON |
 
 ---

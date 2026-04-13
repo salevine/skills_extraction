@@ -11,12 +11,13 @@ import json
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
+from .boilerplate import label_parsed_lines
 from .candidate_mining import CandidateSpan
 from .config import PipelineConfig
 from .llm_backend import call_llm
 from .llm_ollama import parse_json_loose
 from .llm_vllm import call_vllm_direct
-from .preprocessing import extract_description_fields
+from .preprocessing import extract_description_fields, preprocess_description
 from .prompts import (
     EXTRACTOR_SYSTEM,
     EXTRACTOR_USER_TEMPLATE,
@@ -24,6 +25,7 @@ from .prompts import (
     EXTRACTOR_V2_USER_TEMPLATE,
 )
 from .schemas import ParsedLine
+from .sectioning import segment_lines, split_inline_section_headers
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +95,79 @@ def _repair_span_offsets(
 # V2: Whole-job extraction — one LLM call per job
 # ---------------------------------------------------------------------------
 
+def _build_source_lines(job_key: str, desc_raw: str) -> List[ParsedLine]:
+    """Preprocess and segment a raw description into real ParsedLines."""
+    pre = preprocess_description(desc_raw)
+    norm = split_inline_section_headers(pre.description_normalized)
+    lines = segment_lines(job_key, norm)
+    label_parsed_lines(lines)
+    return lines
+
+
+def _anchor_span_to_line(
+    span: str,
+    context: str,
+    section_hint: str,
+    source_lines: List[ParsedLine],
+    used_positions: Dict[str, List[Tuple[str, int]]],
+) -> Optional[Tuple[ParsedLine, int, int]]:
+    """Find the best real ParsedLine containing *span*.
+
+    Strategy:
+    1. If *context* is a true substring of a source line, prefer exact context match.
+    2. Otherwise find all lines containing the span and pick the best one using
+       section hint + deterministic position tracking to avoid repeated-span bugs.
+    3. Returns None if no line contains the span.
+
+    *used_positions* maps span -> list of already-used (line_id, pos) tuples
+    so repeated occurrences bind to distinct source positions.
+    """
+    span_lower = span.lower()
+    used_set = set(tuple(x) for x in used_positions.get(span, []))
+
+    # Pass 1: exact context match (context is a true substring of line text)
+    if context and context.strip():
+        for pl in source_lines:
+            if context in pl.text:
+                pos = pl.text.find(span)
+                if pos >= 0 and (pl.line_id, pos) not in used_set:
+                    used_positions.setdefault(span, []).append((pl.line_id, pos))
+                    return pl, pos, pos + len(span)
+
+    # Pass 2: collect all lines containing the span
+    candidates: List[Tuple[ParsedLine, int]] = []
+    for pl in source_lines:
+        starts = _all_substring_starts(pl.text, span)
+        if not starts:
+            # Case-insensitive fallback
+            starts_lower = _all_substring_starts(pl.text.lower(), span_lower)
+            if starts_lower:
+                starts = starts_lower
+        for s in starts:
+            candidates.append((pl, s))
+
+    if not candidates:
+        return None
+
+    # Sort deterministically: prefer section match, then by document order
+    def _score(item: Tuple[ParsedLine, int]) -> Tuple[int, int, int]:
+        pl, pos = item
+        sec_match = 0 if pl.section.lower() == section_hint.lower() else 1
+        return (sec_match, pl.line_index, pos)
+
+    candidates.sort(key=_score)
+
+    # Pick first candidate not already used for this span
+    for pl, pos in candidates:
+        if (pl.line_id, pos) not in used_set:
+            used_positions.setdefault(span, []).append((pl.line_id, pos))
+            return pl, pos, pos + len(span)
+
+    # All positions used — fall back to first candidate (allow reuse)
+    pl, pos = candidates[0]
+    return pl, pos, pos + len(span)
+
+
 def extract_mentions_for_job(
     cfg: PipelineConfig,
     job: Dict[str, Any],
@@ -102,8 +177,9 @@ def extract_mentions_for_job(
 ) -> List[Dict[str, Any]]:
     """Extract skill mentions from a full job description in a single LLM call.
 
-    Returns a list of mention dicts, each with a ``_parsed_line`` (lightweight
-    ParsedLine) so that stages 2-4 can consume them unchanged.
+    Returns a list of mention dicts, each with a ``_parsed_line`` (a real
+    ParsedLine from the source text) so that stages 2-4 can consume them
+    with accurate section, boilerplate_label, and char offsets.
 
     Args:
         cfg: Pipeline configuration.
@@ -136,6 +212,11 @@ def extract_mentions_for_job(
     if not isinstance(mentions, list):
         return []
 
+    # Build real parsed lines from the source text
+    source_lines = _build_source_lines(job_key, desc_raw)
+    # Track used positions per span to handle repeated spans deterministically
+    used_positions: Dict[str, List[Tuple[str, int]]] = {}
+
     normalized: List[Dict[str, Any]] = []
     for m_idx, m in enumerate(mentions):
         if not isinstance(m, dict):
@@ -144,18 +225,8 @@ def extract_mentions_for_job(
         if not span.strip():
             continue
 
-        # Verify the span actually appears in the description
-        span_pos = desc_raw.find(span)
-        if span_pos < 0:
-            # Try case-insensitive fallback
-            span_pos_lower = desc_raw.lower().find(span.lower())
-            if span_pos_lower < 0:
-                # LLM hallucinated a span not in the text — skip
-                continue
-            span_pos = span_pos_lower
-
         context = m.get("context") or ""
-        section = m.get("section") or "General"
+        section_hint = m.get("section") or "General"
         evidence = str(m.get("evidence", span) or "")
         confidence = m.get("confidence", m.get("span_confidence", 0.7))
         try:
@@ -163,18 +234,17 @@ def extract_mentions_for_job(
         except (TypeError, ValueError):
             confidence = 0.7
 
-        # Build a lightweight ParsedLine so stages 2-4 work unchanged.
-        # line_id is synthetic (job_key + mention index), text is the context
-        # sentence the LLM returned (or the span itself as fallback).
-        pl = ParsedLine(
-            line_id=f"{job_key}_m{m_idx}",
-            section=section,
-            text=context if context.strip() else span,
-            char_start=span_pos,
-            char_end=span_pos + len(span),
-            boilerplate_label="skills_relevant",
-            line_index=m_idx,
+        # Anchor to a real source line — skip if ungroundable
+        anchor = _anchor_span_to_line(
+            span, context, section_hint, source_lines, used_positions,
         )
+        if anchor is None:
+            logger.debug("Skipping ungroundable span %r in %s", span, job_key)
+            continue
+
+        pl, line_cs, line_ce = anchor
+        glob_cs = pl.char_start + line_cs
+        glob_ce = pl.char_start + line_ce
 
         # Classification fields from combined prompt
         requirement = str(m.get("requirement", "unclear")).lower()
@@ -190,13 +260,11 @@ def extract_mentions_for_job(
         m["is_skill"] = True  # if it's in the output, the model considers it a skill
         m["requirement_level"] = requirement
         m["hard_soft"] = hard_soft
-        m["_glob_char_start"] = span_pos
-        m["_glob_char_end"] = span_pos + len(span)
-        # Char offsets within the context line
-        ctx_pos = context.find(span) if context else -1
-        m["_line_char_start"] = ctx_pos if ctx_pos >= 0 else 0
-        m["_line_char_end"] = (ctx_pos + len(span)) if ctx_pos >= 0 else len(span)
-        m["_offset_valid"] = ctx_pos >= 0
+        m["_glob_char_start"] = glob_cs
+        m["_glob_char_end"] = glob_ce
+        m["_line_char_start"] = line_cs
+        m["_line_char_end"] = line_ce
+        m["_offset_valid"] = pl.text[line_cs:line_ce] == span
         m["_parsed_line"] = pl
         normalized.append(m)
 

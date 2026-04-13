@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -77,42 +77,72 @@ def _matching_rules(
 # Windowed parallel execution helper (vLLM only)
 # ---------------------------------------------------------------------------
 
-def _run_windowed(
+class _WorkerError:
+    """Sentinel wrapping a failed future for re-raise in the main thread."""
+    __slots__ = ("exc",)
+    def __init__(self, exc: BaseException):
+        self.exc = exc
+
+
+def _run_rolling(
     total: int,
     start_idx: int,
-    window_size: int,
+    max_workers: int,
     process_fn: Callable[[int], Dict[str, Any]],
     progress_fn: Optional[Callable[[int, int], None]],
     fh,
     records: List[Dict[str, Any]],
 ) -> None:
     """
-    Process items in windows of *window_size* using a thread pool.
+    Process items using a long-lived rolling worker pool.
 
-    Within each window, all items are submitted concurrently. After the window
-    completes, results are sorted by original index and written to the
-    checkpoint file in order (main thread only). Progress callbacks also fire
-    from the main thread during the ordered-write phase.
-
-    Crash mid-window loses at most *window_size* items.
+    A single ThreadPoolExecutor lives for the entire stage. Work is only
+    submitted up to a bounded distance ahead of ``next_write`` so both
+    in-flight futures and out-of-order completed results stay bounded.
+    Results are written to the checkpoint file in original order as
+    contiguous completed items become available.
     """
-    idx = start_idx
-    while idx < total:
-        window_end = min(idx + window_size, total)
-        futures = {}
-        with ThreadPoolExecutor(max_workers=window_size) as pool:
-            for i in range(idx, window_end):
-                futures[i] = pool.submit(process_fn, i)
+    backlog_limit = max_workers * 2
+    pending: Dict[int, Any] = {}  # idx -> result or _WorkerError
+    next_write = start_idx
+    next_submit = start_idx
 
-        # Collect results in original order
-        for i in range(idx, window_end):
-            record = futures[i].result()  # re-raises worker exceptions
-            append_checkpoint_record(fh, record)
-            records.append(record)
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_to_idx: Dict[Any, int] = {}
+
+        def _submit_available() -> None:
+            nonlocal next_submit
+            while next_submit < total and (next_submit - next_write) < backlog_limit:
+                future = pool.submit(process_fn, next_submit)
+                future_to_idx[future] = next_submit
+                next_submit += 1
+
+        _submit_available()
+
+        while next_write < total:
+            if next_write in pending:
+                result = pending.pop(next_write)
+            else:
+                done, _ = wait(tuple(future_to_idx.keys()), return_when=FIRST_COMPLETED)
+                for future in done:
+                    idx = future_to_idx.pop(future)
+                    try:
+                        pending[idx] = future.result()
+                    except Exception as exc:
+                        pending[idx] = _WorkerError(exc)
+                result = pending.pop(next_write, None)
+                if result is None:
+                    continue
+
+            if isinstance(result, _WorkerError):
+                raise result.exc
+
+            append_checkpoint_record(fh, result)
+            records.append(result)
             if progress_fn:
-                progress_fn(i, total)
-
-        idx = window_end
+                progress_fn(next_write, total)
+            next_write += 1
+            _submit_available()
 
 
 # ---------------------------------------------------------------------------
@@ -482,13 +512,15 @@ def _run_stage1_extract(
             write_checkpoint_header(fh, run_id, "stage1_extracted", len(jobs))
 
         if cfg.backend == "vllm":
-            # vLLM parallel: one LLM call per job, 8 concurrent workers.
-            # Each worker gets a dedicated endpoint via round-robin.
+            # vLLM parallel: one LLM call per job, concurrent workers.
+            # Checkpoint incrementally: write contiguous completed records
+            # in job order as soon as they are available.
             endpoints = cfg.vllm_endpoints()
             completed_count = [0]
             failed_count = [0]
             total_jobs = len(jobs) - start_idx
-            job_results: Dict[int, List[Dict[str, Any]]] = {}
+            pending_results: Dict[int, List[Dict[str, Any]]] = {}
+            next_write_idx = start_idx
 
             with ThreadPoolExecutor(max_workers=len(endpoints)) as pool:
                 future_to_idx = {}
@@ -506,10 +538,10 @@ def _run_stage1_extract(
                     idx = future_to_idx[future]
                     try:
                         mentions = future.result()
-                        job_results[idx] = mentions
+                        pending_results[idx] = mentions
                     except Exception as e:
                         logger.debug("vLLM extractor job %d failed: %s", idx, e)
-                        job_results[idx] = []
+                        pending_results[idx] = []
                         failed_count[0] += 1
                     completed_count[0] += 1
                     if progress_cb:
@@ -519,23 +551,24 @@ def _run_stage1_extract(
                                     f"job {completed_count[0]}/{total_jobs}{fail_info}",
                                     {"stage": "stage1_extract"})
 
+                    # Flush contiguous completed records in job order
+                    while next_write_idx in pending_results:
+                        raw_mentions = pending_results.pop(next_write_idx)
+                        _job = jobs[next_write_idx]
+                        _job_key = stable_job_key(_job, next_write_idx)
+                        record = {
+                            "job_index": next_write_idx,
+                            "job_key": _job_key,
+                            "extractor_model_used": cfg.extractor_model,
+                            "raw_mentions": [serialize_mention(m) for m in raw_mentions],
+                        }
+                        append_checkpoint_record(fh, record)
+                        records.append(record)
+                        next_write_idx += 1
+
             if failed_count[0]:
                 logger.warning("vLLM extraction: %d/%d jobs failed (timeouts/errors)",
                                failed_count[0], total_jobs)
-
-            # Write checkpoint records in job order
-            for idx in range(start_idx, len(jobs)):
-                job = jobs[idx]
-                job_key = stable_job_key(job, idx)
-                raw_mentions = job_results.get(idx, [])
-                record = {
-                    "job_index": idx,
-                    "job_key": job_key,
-                    "extractor_model_used": cfg.extractor_model,
-                    "raw_mentions": [serialize_mention(m) for m in raw_mentions],
-                }
-                append_checkpoint_record(fh, record)
-                records.append(record)
         else:
             # Ollama / OpenRouter: sequential, one call per job
             for idx in range(start_idx, len(jobs)):
@@ -613,10 +646,10 @@ def _run_stage2_verify(
                                 f"verifying mention {i+1}/{total}",
                                 {"stage": "stage2_verify"})
 
-            _run_windowed(
+            _run_rolling(
                 total=total_mentions,
                 start_idx=start_idx,
-                window_size=cfg.vllm_num_endpoints,
+                max_workers=cfg.vllm_num_endpoints,
                 process_fn=lambda mi: _process_verify_item(mi, mention_tasks, cfg),
                 progress_fn=_s2_progress,
                 fh=fh,
@@ -739,10 +772,10 @@ def _run_stage3_requirement(
                                 f"classifying requirement {i+1}/{total}",
                                 {"stage": "stage3_requirement"})
 
-            _run_windowed(
+            _run_rolling(
                 total=total_mentions,
                 start_idx=start_idx,
-                window_size=cfg.vllm_num_endpoints,
+                max_workers=cfg.vllm_num_endpoints,
                 process_fn=lambda mi: _process_requirement_item(mi, mention_tasks, v_lookup, cfg),
                 progress_fn=_s3_progress,
                 fh=fh,
@@ -860,10 +893,10 @@ def _run_stage4_hardsoft(
                                 f"classifying hard/soft {i+1}/{total}",
                                 {"stage": "stage4_hardsoft"})
 
-            _run_windowed(
+            _run_rolling(
                 total=total_mentions,
                 start_idx=start_idx,
-                window_size=cfg.vllm_num_endpoints,
+                max_workers=cfg.vllm_num_endpoints,
                 process_fn=lambda mi: _process_hardsoft_item(mi, mention_tasks, v_lookup, cfg),
                 progress_fn=_s4_progress,
                 fh=fh,
@@ -971,6 +1004,9 @@ def _run_stage5_assemble(
     for idx, job in enumerate(jobs):
         job_key = stable_job_key(job, idx)
         title, desc_raw = extract_description_fields(job)
+        # Compute normalized text so exported offsets have a matching reference
+        _pre = preprocess_description(desc_raw)
+        desc_normalized = split_inline_section_headers(_pre.description_normalized)
         s1 = s1_by_job.get(idx, {})
         extractor_model_used = s1.get("extractor_model_used", cfg.extractor_model)
 
@@ -1007,8 +1043,8 @@ def _run_stage5_assemble(
             rules = ["llm_extractor"]
 
             # --- Verifier output ---
-            # If the combined extractor provided is_skill, use it directly.
-            # Otherwise fall back to stage 2 lookup.
+            # Stage 2 is authoritative when it ran. Extractor is_skill is
+            # only used as fallback when stage 2 was skipped / not present.
             extractor_is_skill = m.get("is_skill")
             vout = v_lookup.get((idx, m_idx), {"status": "skipped"})
             v_status = vout.get("status", "skipped")
@@ -1021,16 +1057,20 @@ def _run_stage5_assemble(
             if v_status == "rejected":
                 stage_counters["skill_verifier_rejected"] += 1
 
-            if extractor_is_skill is not None:
+            if v_status in ("accepted", "rejected", "parse_failed", "error"):
+                # Stage 2 actually ran — its result is authoritative
+                is_skill = _mention_is_skill(vout)
+            elif extractor_is_skill is not None:
+                # Stage 2 did not run; fall back to extractor field
                 is_skill = bool(extractor_is_skill)
                 v_status = "extractor"
                 v_conf = raw_conf
             else:
-                is_skill = _mention_is_skill(vout)
+                is_skill = True  # default if neither ran
 
             # --- Requirement output ---
-            # If the combined extractor provided requirement_level, use it.
-            # Otherwise fall back to stage 3 lookup.
+            # Stage 3 is authoritative when it ran. Extractor requirement_level
+            # is only used as fallback when stage 3 was skipped / not present.
             extractor_req = m.get("requirement_level")
             rout = req_lookup.get((idx, m_idx), {"status": "skipped"})
             req_status = rout.get("status", "skipped")
@@ -1038,20 +1078,23 @@ def _run_stage5_assemble(
             req_conf = rout.get("confidence")
             req_notes = rout.get("notes", "")
 
-            if extractor_req and extractor_req in ("required", "optional", "unclear"):
-                req_lvl = extractor_req
-                req_status = "extractor"
-                req_conf = raw_conf
-            else:
+            if req_status in ("completed", "parse_failed", "error"):
+                # Stage 3 actually ran — use its result
                 req_lvl = rout.get("requirement_level", "unclear")
                 if req_status == "parse_failed":
                     stage_counters["requirement_parse_failed"] += 1
                 if req_status == "error":
                     stage_counters["stage_errors"] += 1
+            elif extractor_req and extractor_req in ("required", "optional", "unclear"):
+                req_lvl = extractor_req
+                req_status = "extractor"
+                req_conf = raw_conf
+            else:
+                req_lvl = "unclear"
 
             # --- Hard/soft output ---
-            # If the combined extractor provided hard_soft, use it.
-            # Otherwise fall back to stage 4 lookup.
+            # Stage 4 is authoritative when it ran. Extractor hard_soft
+            # is only used as fallback when stage 4 was skipped / not present.
             extractor_hs = m.get("hard_soft")
             hsout = hs_lookup.get((idx, m_idx), {"status": "skipped"})
             hs_status = hsout.get("status", "skipped")
@@ -1059,18 +1102,22 @@ def _run_stage5_assemble(
             hs_conf = hsout.get("confidence")
             hs_notes = hsout.get("notes", "")
 
-            if extractor_hs and extractor_hs in ("hard", "soft", "unknown"):
-                hard_soft = extractor_hs
-                hs_status = "extractor"
-                hs_conf = raw_conf
-            else:
+            if hs_status in ("completed", "parse_failed", "error"):
+                # Stage 4 actually ran — use its result
                 hard_soft = hsout.get("hard_soft", "unknown")
                 if hs_status == "parse_failed":
                     stage_counters["hardsoft_parse_failed"] += 1
                 if hs_status == "error":
                     stage_counters["stage_errors"] += 1
+            elif extractor_hs and extractor_hs in ("hard", "soft", "unknown"):
+                hard_soft = extractor_hs
+                hs_status = "extractor"
+                hs_conf = raw_conf
+            else:
+                hard_soft = "unknown"
 
-            # Build pipeline_audit
+            # Build pipeline_audit — preserve extractor's original classifications
+            # separately from the final authoritative values chosen above.
             pipeline_audit: Dict[str, Any] = {
                 "extractor": {
                     "status": "completed",
@@ -1083,8 +1130,9 @@ def _run_stage5_assemble(
                         "evidence": evidence,
                         "span_confidence": raw_conf,
                         "reason": str(m.get("reason", "")),
-                        "requirement_level": req_lvl,
-                        "hard_soft": hard_soft,
+                        "is_skill": bool(extractor_is_skill) if extractor_is_skill is not None else None,
+                        "requirement_level": str(extractor_req) if extractor_req else None,
+                        "hard_soft": str(extractor_hs) if extractor_hs else None,
                     },
                 },
                 "skill_verifier": {"status": v_status, "model": v_model},
@@ -1165,6 +1213,7 @@ def _run_stage5_assemble(
 
         augmentation = {
             "description_raw": desc_raw,
+            "description_normalized": desc_normalized,
             "skill_mentions": skill_mentions,
             "pipeline_stage_audit": {
                 "stage_counters": stage_counters,

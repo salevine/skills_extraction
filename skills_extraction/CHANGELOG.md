@@ -5,6 +5,47 @@ This file is the canonical changelog for the skills-extraction project.
 
 ---
 
+## [3.3.0] — 2026-04-13 — Stage authority, source grounding, vLLM throughput
+
+### Stage-authority fix (correctness)
+
+- **Problem:** Stage 5 assembly preferred extractor-supplied `is_skill`, `requirement_level`, and `hard_soft` over later verifier/classifier results. A stage-2 rejection could be silently overridden, producing `is_skill=True` with `verifier_status="extractor"` in final output.
+- **Fix:** Stages 2-4 are now authoritative when they ran. A stage-2 rejection forces `is_skill=False`. Stage-3/4 `requirement_level` and `hard_soft` override extractor values when those stages completed, errored, or parse-failed. Extractor values are used only as fallback when the later stage was skipped.
+- **Traceability:** Original extractor classifications (`is_skill`, `requirement_level`, `hard_soft`) are preserved in `pipeline_audit.extractor.output` for audit purposes.
+
+### Whole-job mention grounding (correctness)
+
+- **Problem:** `extract_mentions_for_job()` built synthetic `ParsedLine` objects from model-returned context, hardcoded `boilerplate_label="skills_relevant"`, and used `desc_raw.find(span)` for offsets. Repeated spans could bind to the wrong occurrence; downstream stages judged model-written context instead of source text; boilerplate penalties never fired.
+- **Fix:** Mentions are now anchored to real `ParsedLine` objects from the source text. The raw description is preprocessed through `preprocess_description()` → `split_inline_section_headers()` → `segment_lines()` → `label_parsed_lines()`. Each mention is grounded by exact context match (preferred), section-hint-aware span search, or deterministic position tracking for repeated spans. Ungroundable spans are skipped.
+- **Offset semantics:** `char_start`/`char_end` now index into `description_normalized` (the whitespace-normalized, section-split text). Stage 5 exports `description_normalized` alongside `description_raw` so consumers have a matching reference string.
+
+### Rolling worker pool (throughput)
+
+- **Problem:** `_run_windowed()` created a new `ThreadPoolExecutor` for every window and blocked at each boundary. One slow mention stalled the next batch.
+- **Fix:** Replaced with `_run_rolling()` — a single long-lived `ThreadPoolExecutor` with bounded submission (`max_workers * 2` items ahead of the write head). Completed results are flushed in original order as contiguous items become available. No executor rebuild, no window boundary stalls.
+- **Memory:** Submission is gated by `next_submit - next_write < backlog_limit`, so both in-flight futures and buffered out-of-order results stay bounded.
+
+### Incremental stage-1 vLLM checkpointing (resilience)
+
+- **Problem:** The vLLM stage-1 path buffered all results in memory and wrote checkpoints only after every future completed. A crash mid-stage forced a full rerun.
+- **Fix:** Checkpoint records are now written incrementally as contiguous completed jobs become available. A crash loses only the incomplete tail, not the entire stage.
+
+### vLLM client improvements (throughput)
+
+- **Session reuse:** `llm_vllm.py` now uses per-thread `requests.Session` instances via `threading.local()`, reusing TCP connections within each worker thread without cross-thread contention.
+- **Decoupled delay:** vLLM calls use a separate `vllm_per_call_delay_sec` config field (default `0.0`) instead of the shared `per_call_delay_sec` (still `0.25` for Ollama/OpenRouter). No artificial throttling on the vLLM path by default.
+
+### Config changes
+
+- **New field:** `PipelineConfig.vllm_per_call_delay_sec` (default `0.0`).
+- **Unchanged:** `per_call_delay_sec` (default `0.25`) still applies to Ollama/OpenRouter.
+
+### Tests
+
+- `test_fixes.py`: 8 regression tests covering stage-authority override, classifier authority, repeated-span grounding, ungroundable span skipping, context-match preference, offset/normalized-text consistency, thread-local session isolation, and rolling pool memory boundedness.
+
+---
+
 ## [3.2.2] — 2026-04-12 — Checkpoint resilience, status tooling, Windows deploy
 
 ### Checkpoint error handling
