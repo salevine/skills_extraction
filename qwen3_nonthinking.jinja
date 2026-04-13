@@ -1,0 +1,35 @@
+{%- if messages and messages[0]["role"] == "system" %}
+{%- set loop_messages = messages %}
+{%- else %}
+{%- set loop_messages = messages %}
+{%- endif %}
+{%- if bos_token is defined and bos_token %}
+{{- bos_token }}
+{%- endif %}
+{%- for message in loop_messages %}
+{%- set role = message["role"] %}
+{%- if role in ["system", "user", "assistant"] %}
+{{- "<|im_start|>" + role + "\n" }}
+{%- if message["content"] is string %}
+{{- message["content"] }}
+{%- elif message["content"] is sequence %}
+{%- for part in message["content"] %}
+{%- if part is mapping and part.get("type") == "text" %}
+{{- part.get("text", "") }}
+{%- endif %}
+{%- endfor %}
+{%- endif %}
+{{- "<|im_end|>\n" }}
+{%- elif role == "tool" %}
+{{- "<|im_start|>tool\n" }}
+{%- if message["content"] is string %}
+{{- message["content"] }}
+{%- else %}
+{{- message["content"] | tojson }}
+{%- endif %}
+{{- "<|im_end|>\n" }}
+{%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+{{- "<|im_start|>assistant\n" }}
+{%- endif %}

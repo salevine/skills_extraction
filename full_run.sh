@@ -16,7 +16,7 @@ echo "=== Run ID: $RUN_ID ==="
 
 # ------------------------------------------------------------------
 # Stage 1: Extract with Qwen (assumes Qwen vLLM servers already running)
-# Start them first if needed:  ~/startQwen 8
+# Start them first if needed:  ./startQwen 8
 # ------------------------------------------------------------------
 echo ""
 echo "=== Checking Qwen vLLM servers ==="

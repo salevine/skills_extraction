@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 
 REMOTE="stacey@titan3.cs.gsu.edu"
+REMOTE_REPO="~/skills_extraction"
 
 echo "Starting Qwen workers..."
-ssh "$REMOTE" "./startQwen 8" &
+ssh "$REMOTE" "cd $REMOTE_REPO && ./startQwen 8" &
 
 echo "Waiting for startup..."
 sleep 15
