@@ -62,12 +62,13 @@ class RunStats:
             entry["wall_sec"] = round(time.perf_counter() - entry["started_at"], 3)
 
     def record_llm(self, model: str, elapsed_sec: float, role: str = "extractor") -> None:
-        """Record an LLM call. role is 'extractor' or 'verifier'."""
+        """Record an LLM call. role is 'extractor', 'verifier', 'requirement_classifier', or 'hardsoft_classifier'."""
         with self._stats_lock:
             if role == "extractor":
                 self._extractor_by_model[model]["calls"] += 1
                 self._extractor_by_model[model]["sec"] += elapsed_sec
             else:
+                # verifier, requirement_classifier, hardsoft_classifier all count as post-extraction
                 self._verifier_by_model[model]["calls"] += 1
                 self._verifier_by_model[model]["sec"] += elapsed_sec
 

@@ -14,10 +14,15 @@ from typing import Any, Dict, List
 logger = logging.getLogger(__name__)
 
 
-def write_augmented_jobs(path: Path, jobs: List[Dict[str, Any]]) -> None:
+def write_augmented_jobs(path: Path, jobs: List[Dict[str, Any]], pretty: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(jobs, ensure_ascii=False, indent=2), encoding="utf-8")
-    logger.info("Wrote augmented jobs: %s", path)
+    indent = 2 if pretty else None
+    separators = None if pretty else (",", ":")
+    path.write_text(
+        json.dumps(jobs, ensure_ascii=False, indent=indent, separators=separators),
+        encoding="utf-8",
+    )
+    logger.info("Wrote augmented jobs (%s): %s", "pretty" if pretty else "compact", path)
 
 
 def write_mentions_jsonl(path: Path, jobs: List[Dict[str, Any]]) -> None:

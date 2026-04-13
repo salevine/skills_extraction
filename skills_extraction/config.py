@@ -82,9 +82,11 @@ class PipelineConfig:
     quality_complete_min_score: float = 0.45
 
     # Pipeline
-    pipeline_version: str = "3.3.0"
+    pipeline_version: str = "3.4.0"
     skip_llm: bool = False  # for tests: candidates only
     disable_thinking: bool = True  # append /no_think to suppress qwen3 thinking mode
+    checkpoint_flush_interval: int = 16  # flush checkpoint every N records (1=every record)
+    export_pretty_json: bool = False  # True for indent=2, False for compact (faster)
 
     # Runtime timing: (model: str, elapsed_sec: float, role: "extractor"|"verifier") -> None
     llm_timing_callback: Optional[Callable[[str, float, str], None]] = None

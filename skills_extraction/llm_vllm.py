@@ -105,6 +105,33 @@ def call_vllm_direct(
     raise RuntimeError(f"vLLM failed after {cfg.vllm_max_retries} attempts: {last_err}")
 
 
+def call_vllm_direct_with_failover(
+    cfg: PipelineConfig,
+    preferred_endpoint: str,
+    all_endpoints: list,
+    model: str,
+    system: str,
+    user: str,
+    temperature: float = 0.1,
+    role: str = "extractor",
+) -> str:
+    """Try *preferred_endpoint* first, then fail over to other endpoints.
+
+    Each endpoint gets ``cfg.vllm_max_retries`` attempts before the next
+    endpoint is tried.  Raises after all endpoints are exhausted.
+    """
+    # Build ordered list: preferred first, then the rest
+    ordered = [preferred_endpoint] + [ep for ep in all_endpoints if ep != preferred_endpoint]
+    last_err: Optional[Exception] = None
+    for endpoint in ordered:
+        try:
+            return call_vllm_direct(cfg, endpoint, model, system, user, temperature, role)
+        except Exception as e:
+            last_err = e
+            logger.warning("vLLM failover: %s exhausted, trying next endpoint", endpoint)
+    raise RuntimeError(f"vLLM failed on all {len(ordered)} endpoints: {last_err}")
+
+
 def call_vllm(
     cfg: PipelineConfig,
     model: str,

@@ -139,6 +139,7 @@ class ExtractionMetadata:
     job_key: str
     started_at: str
     completed_at: str = ""
+    error: str = ""
     extra: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:

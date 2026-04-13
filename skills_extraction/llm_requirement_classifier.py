@@ -31,7 +31,7 @@ def classify_requirement_level(
         mention_json=json.dumps(mention_dict, ensure_ascii=False),
     )
     raw = call_llm(
-        cfg, model, REQUIREMENT_CLASSIFIER_SYSTEM, user, temperature=0.05, role="verifier"
+        cfg, model, REQUIREMENT_CLASSIFIER_SYSTEM, user, temperature=0.05, role="requirement_classifier"
     )
     try:
         data = parse_json_loose(raw)

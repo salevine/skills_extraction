@@ -4,7 +4,6 @@ Load and save JSON; preserve original job records (append-only augmentation).
 
 from __future__ import annotations
 
-import copy
 import json
 import logging
 from pathlib import Path
@@ -40,12 +39,15 @@ def stable_job_key(job: Dict[str, Any], index: int) -> str:
 
 def augment_job_record(original: Dict[str, Any], augmentation: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Shallow+deep merge: copy original, then add/update only known augmentation keys.
-    Does not remove original keys.
+    Merge original job fields with pipeline augmentation.
+
+    Uses a shallow copy of the original dict — safe because augmentation fully
+    replaces every complex field (skill_mentions, extraction_metadata, etc.)
+    rather than mutating nested structures in-place. Original job fields are
+    typically flat scalars from JSON input.
     """
-    out = copy.deepcopy(original)
-    for k, v in augmentation.items():
-        out[k] = v
+    out = dict(original)  # shallow copy — O(n) keys, no recursive descent
+    out.update(augmentation)
     return out
 
 

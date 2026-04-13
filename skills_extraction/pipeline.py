@@ -20,13 +20,14 @@ from .checkpoint import (
     append_checkpoint_record,
     checkpoint_complete,
     checkpoint_path,
+    compute_stage_fingerprint,
     count_checkpoint_records,
     deserialize_candidate,
-    deserialize_mention,
+    deserialize_mentions_for_job,
     deserialize_parsed_line,
     load_checkpoint,
     serialize_candidate,
-    serialize_mention,
+    serialize_mentions_for_job,
     serialize_parsed_line,
     write_checkpoint_footer,
     write_checkpoint_header,
@@ -54,6 +55,10 @@ from .sectioning import segment_lines, split_inline_section_headers
 
 logger = logging.getLogger(__name__)
 
+# Stage fingerprints — populated by run_pipeline(), read by stage functions
+# when writing checkpoint headers. Maps stage_name -> fingerprint string.
+_stage_fingerprints: Dict[str, str] = {}
+
 
 # ---------------------------------------------------------------------------
 # Matching-rules helper (unchanged from original)
@@ -70,7 +75,7 @@ def _matching_rules(
             g0 <= c.char_start and g1 >= c.char_end
         ):
             rules.append(c.rule_source)
-    return list(dict.fromkeys(rules)) if rules else ["llm_extractor"]
+    return list(dict.fromkeys(rules))
 
 
 # ---------------------------------------------------------------------------
@@ -187,11 +192,13 @@ def _process_extract_job(
                     except Exception as e2:
                         logger.error("Fallback extractor failed: %s", e2)
 
+    ser_mentions, lines_reg = serialize_mentions_for_job(raw_mentions)
     return {
         "job_index": s0["job_index"],
         "job_key": job_key,
         "extractor_model_used": extractor_model_used,
-        "raw_mentions": [serialize_mention(m) for m in raw_mentions],
+        "raw_mentions": ser_mentions,
+        "_parsed_lines": lines_reg,
     }
 
 
@@ -509,62 +516,89 @@ def _run_stage1_extract(
     mode = "a" if start_idx > 0 else "w"
     with open(path, mode, encoding="utf-8") as fh:
         if start_idx == 0:
-            write_checkpoint_header(fh, run_id, "stage1_extracted", len(jobs))
+            write_checkpoint_header(fh, run_id, "stage1_extracted", len(jobs),
+                                       fingerprint=_stage_fingerprints.get("stage1_extracted"))
 
         if cfg.backend == "vllm":
-            # vLLM parallel: one LLM call per job, concurrent workers.
-            # Checkpoint incrementally: write contiguous completed records
-            # in job order as soon as they are available.
+            # vLLM parallel: one LLM call per job, bounded rolling submission
+            # with endpoint failover and incremental checkpointing.
             endpoints = cfg.vllm_endpoints()
             completed_count = [0]
             failed_count = [0]
             total_jobs = len(jobs) - start_idx
-            pending_results: Dict[int, List[Dict[str, Any]]] = {}
+            num_workers = len(endpoints)
+            backlog_limit = num_workers * 2
+
+            pending_results: Dict[int, Dict[str, Any]] = {}
             next_write_idx = start_idx
+            next_submit_idx = start_idx
 
-            with ThreadPoolExecutor(max_workers=len(endpoints)) as pool:
-                future_to_idx = {}
-                for idx in range(start_idx, len(jobs)):
-                    job = jobs[idx]
-                    job_key = stable_job_key(job, idx)
-                    ep = endpoints[idx % len(endpoints)]
-                    f = pool.submit(
-                        extract_mentions_for_job,
-                        cfg, job, job_key, cfg.extractor_model, ep,
-                    )
-                    future_to_idx[f] = idx
+            with ThreadPoolExecutor(max_workers=num_workers) as pool:
+                future_to_idx: Dict[Any, int] = {}
 
-                for future in as_completed(future_to_idx):
-                    idx = future_to_idx[future]
-                    try:
-                        mentions = future.result()
-                        pending_results[idx] = mentions
-                    except Exception as e:
-                        logger.debug("vLLM extractor job %d failed: %s", idx, e)
-                        pending_results[idx] = []
-                        failed_count[0] += 1
-                    completed_count[0] += 1
-                    if progress_cb:
-                        fail_info = f" ({failed_count[0]} failed)" if failed_count[0] else ""
-                        progress_cb(completed_count[0] - 1, total_jobs,
-                                    "stage1_extract",
-                                    f"job {completed_count[0]}/{total_jobs}{fail_info}",
-                                    {"stage": "stage1_extract"})
+                def _submit_available() -> None:
+                    nonlocal next_submit_idx
+                    while (next_submit_idx < len(jobs)
+                           and (next_submit_idx - next_write_idx) < backlog_limit):
+                        _job = jobs[next_submit_idx]
+                        _job_key = stable_job_key(_job, next_submit_idx)
+                        ep = endpoints[next_submit_idx % num_workers]
+                        f = pool.submit(
+                            extract_mentions_for_job,
+                            cfg, _job, _job_key, cfg.extractor_model, ep,
+                            all_endpoints=endpoints,
+                        )
+                        future_to_idx[f] = next_submit_idx
+                        next_submit_idx += 1
 
-                    # Flush contiguous completed records in job order
-                    while next_write_idx in pending_results:
-                        raw_mentions = pending_results.pop(next_write_idx)
-                        _job = jobs[next_write_idx]
-                        _job_key = stable_job_key(_job, next_write_idx)
-                        record = {
-                            "job_index": next_write_idx,
-                            "job_key": _job_key,
-                            "extractor_model_used": cfg.extractor_model,
-                            "raw_mentions": [serialize_mention(m) for m in raw_mentions],
-                        }
-                        append_checkpoint_record(fh, record)
-                        records.append(record)
-                        next_write_idx += 1
+                _submit_available()
+
+                while next_write_idx < len(jobs):
+                    if next_write_idx in pending_results:
+                        result = pending_results.pop(next_write_idx)
+                    else:
+                        done, _ = wait(tuple(future_to_idx.keys()), return_when=FIRST_COMPLETED)
+                        for future in done:
+                            idx = future_to_idx.pop(future)
+                            try:
+                                pending_results[idx] = {
+                                    "raw_mentions": future.result(),
+                                    "stage1_error": "",
+                                }
+                            except Exception as e:
+                                logger.debug("vLLM extractor job %d failed: %s", idx, e)
+                                pending_results[idx] = {
+                                    "raw_mentions": [],
+                                    "stage1_error": str(e)[:200],
+                                }
+                                failed_count[0] += 1
+                            completed_count[0] += 1
+                            if progress_cb:
+                                fail_info = f" ({failed_count[0]} failed)" if failed_count[0] else ""
+                                progress_cb(completed_count[0] - 1, total_jobs,
+                                            "stage1_extract",
+                                            f"job {completed_count[0]}/{total_jobs}{fail_info}",
+                                            {"stage": "stage1_extract"})
+                        result = pending_results.pop(next_write_idx, None)
+                        if result is None:
+                            continue
+
+                    _job = jobs[next_write_idx]
+                    _job_key = stable_job_key(_job, next_write_idx)
+                    ser_mentions, lines_reg = serialize_mentions_for_job(result["raw_mentions"])
+                    record = {
+                        "job_index": next_write_idx,
+                        "job_key": _job_key,
+                        "extractor_model_used": cfg.extractor_model,
+                        "raw_mentions": ser_mentions,
+                        "_parsed_lines": lines_reg,
+                    }
+                    if result["stage1_error"]:
+                        record["stage1_error"] = result["stage1_error"]
+                    append_checkpoint_record(fh, record)
+                    records.append(record)
+                    next_write_idx += 1
+                    _submit_available()
 
             if failed_count[0]:
                 logger.warning("vLLM extraction: %d/%d jobs failed (timeouts/errors)",
@@ -581,6 +615,7 @@ def _run_stage1_extract(
                                 {"stage": "stage1_extract"})
 
                 extractor_model_used = cfg.extractor_model
+                stage1_error = ""
                 try:
                     raw_mentions = extract_mentions_for_job(
                         cfg, job, job_key, model=cfg.extractor_model,
@@ -595,13 +630,18 @@ def _run_stage1_extract(
                     except Exception as e2:
                         logger.error("Fallback extractor failed for %s: %s", job_key, e2)
                         raw_mentions = []
+                        stage1_error = str(e2)[:200]
 
+                ser_mentions, lines_reg = serialize_mentions_for_job(raw_mentions)
                 record = {
                     "job_index": idx,
                     "job_key": job_key,
                     "extractor_model_used": extractor_model_used,
-                    "raw_mentions": [serialize_mention(m) for m in raw_mentions],
+                    "raw_mentions": ser_mentions,
+                    "_parsed_lines": lines_reg,
                 }
+                if stage1_error:
+                    record["stage1_error"] = stage1_error
                 append_checkpoint_record(fh, record)
                 records.append(record)
 
@@ -637,7 +677,8 @@ def _run_stage2_verify(
     mode = "a" if start_idx > 0 else "w"
     with open(path, mode, encoding="utf-8") as fh:
         if start_idx == 0:
-            write_checkpoint_header(fh, run_id, "stage2_verified", total_mentions)
+            write_checkpoint_header(fh, run_id, "stage2_verified", total_mentions,
+                                       fingerprint=_stage_fingerprints.get("stage2_verified"))
 
         if cfg.backend == "vllm":
             def _s2_progress(i: int, total: int) -> None:
@@ -763,7 +804,8 @@ def _run_stage3_requirement(
     mode = "a" if start_idx > 0 else "w"
     with open(path, mode, encoding="utf-8") as fh:
         if start_idx == 0:
-            write_checkpoint_header(fh, run_id, "stage3_requirement", total_mentions)
+            write_checkpoint_header(fh, run_id, "stage3_requirement", total_mentions,
+                                       fingerprint=_stage_fingerprints.get("stage3_requirement"))
 
         if cfg.backend == "vllm":
             def _s3_progress(i: int, total: int) -> None:
@@ -884,7 +926,8 @@ def _run_stage4_hardsoft(
     mode = "a" if start_idx > 0 else "w"
     with open(path, mode, encoding="utf-8") as fh:
         if start_idx == 0:
-            write_checkpoint_header(fh, run_id, "stage4_hardsoft", total_mentions)
+            write_checkpoint_header(fh, run_id, "stage4_hardsoft", total_mentions,
+                                       fingerprint=_stage_fingerprints.get("stage4_hardsoft"))
 
         if cfg.backend == "vllm":
             def _s4_progress(i: int, total: int) -> None:
@@ -1007,10 +1050,17 @@ def _run_stage5_assemble(
         # Compute normalized text so exported offsets have a matching reference
         _pre = preprocess_description(desc_raw)
         desc_normalized = split_inline_section_headers(_pre.description_normalized)
+        line_texts = desc_normalized.split("\n")
+        qa = assess_quality(desc_raw, desc_normalized, line_texts, cfg.quality_complete_min_score)
         s1 = s1_by_job.get(idx, {})
         extractor_model_used = s1.get("extractor_model_used", cfg.extractor_model)
+        job_error = str(s1.get("stage1_error", "") or "")
+        if not s1:
+            job_error = "missing_stage1_record"
 
         raw_mentions_ser = s1.get("raw_mentions", [])
+        lines_reg_raw = s1.get("_parsed_lines")  # may be None for older checkpoints
+        raw_mentions_deser = deserialize_mentions_for_job(raw_mentions_ser, lines_reg_raw)
         skill_mentions: List[Dict[str, Any]] = []
         mention_counter = 0
         stage_counters: Dict[str, int] = {
@@ -1021,9 +1071,10 @@ def _run_stage5_assemble(
             "hardsoft_parse_failed": 0,
             "stage_errors": 0,
         }
+        if job_error:
+            stage_counters["stage_errors"] += 1
 
-        for m_idx, m_ser in enumerate(raw_mentions_ser):
-            m = deserialize_mention(m_ser)
+        for m_idx, m in enumerate(raw_mentions_deser):
             pl = m.get("_parsed_line")
             if pl is None:
                 continue
@@ -1040,7 +1091,7 @@ def _run_stage5_assemble(
             evidence = str(m.get("evidence", span))
             evidence_ok = evidence in line_text if evidence else False
             raw_conf = float(m.get("span_confidence", m.get("confidence", 0.7)))
-            rules = ["llm_extractor"]
+            rules = []  # no synthetic rule boost; only real rule matches get credit
 
             # --- Verifier output ---
             # Stage 2 is authoritative when it ran. Extractor is_skill is
@@ -1204,6 +1255,7 @@ def _run_stage5_assemble(
             job_key=job_key,
             started_at=started,
             completed_at=completed,
+            error=job_error,
             extra={
                 "job_title_snapshot": (title or "")[:200],
                 "requirement_model": cfg.requirement_model if cfg.requirement_classifier_enabled else "",
@@ -1214,9 +1266,11 @@ def _run_stage5_assemble(
         augmentation = {
             "description_raw": desc_raw,
             "description_normalized": desc_normalized,
+            "quality_assessment": qa.to_dict(),
             "skill_mentions": skill_mentions,
             "pipeline_stage_audit": {
                 "stage_counters": stage_counters,
+                "job_error": job_error,
                 "models": {
                     "extractor_model": extractor_model_used,
                     "skill_verifier_model": cfg.verifier_model if cfg.verifier_enabled else "",
@@ -1249,8 +1303,9 @@ def _build_mention_task_list(
     for s1 in stage1_data:
         job_idx = s1["job_index"]
         job_key = s1["job_key"]
-        for m_idx, m_ser in enumerate(s1.get("raw_mentions", [])):
-            m = deserialize_mention(m_ser)
+        lines_reg_raw = s1.get("_parsed_lines")
+        mentions = deserialize_mentions_for_job(s1.get("raw_mentions", []), lines_reg_raw)
+        for m_idx, m in enumerate(mentions):
             pl = m.get("_parsed_line")
             if pl is not None:
                 tasks.append((job_idx, job_key, m_idx, m, pl))
@@ -1258,11 +1313,16 @@ def _build_mention_task_list(
 
 
 def _mention_is_skill(verifier_output: Dict[str, Any]) -> bool:
-    """Determine if a mention is considered a skill based on verifier output."""
+    """Determine if a mention is considered a skill based on verifier output.
+
+    Returns True only for accepted or skipped mentions. Rejected, error,
+    and parse_failed all return False to avoid wasting LLM calls on
+    uncertain mentions in stages 3-4.
+    """
     status = verifier_output.get("status", "skipped")
-    if status == "rejected":
+    if status in ("rejected", "error", "parse_failed"):
         return False
-    # For skipped, error, parse_failed, accepted: default True
+    # For skipped, accepted: default True
     return bool(verifier_output.get("is_skill", True))
 
 
@@ -1278,11 +1338,13 @@ def _load_or_run_stage(
     total_expected: int,
     run_fn: Callable,
     progress_cb: Optional[Callable] = None,
+    fingerprint: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Check if a checkpoint exists for this stage:
-    - Complete checkpoint + resume=True -> load from file
-    - Partial checkpoint + resume=True -> resume from last record
+    - Complete checkpoint + resume=True + fingerprint matches -> load from file
+    - Partial checkpoint + resume=True + fingerprint matches -> resume from last record
+    - Fingerprint mismatch -> invalidate and rerun from scratch
     - Otherwise -> run from scratch
     """
     path = checkpoint_path(ckpt_dir.parent, run_id, stage_name)
@@ -1290,6 +1352,16 @@ def _load_or_run_stage(
     if resume and path.exists():
         if checkpoint_complete(path):
             meta, records = load_checkpoint(path)
+            # Any current fingerprint requires a matching checkpoint fingerprint.
+            ckpt_fp = meta.get("fingerprint")
+            if fingerprint and ckpt_fp != fingerprint:
+                logger.warning(
+                    "Checkpoint %s fingerprint mismatch or missing fingerprint "
+                    "(checkpoint=%s, current=%s); "
+                    "config/prompts changed — rerunning from scratch",
+                    stage_name, (ckpt_fp or "<missing>")[:8], fingerprint[:8],
+                )
+                return run_fn(start_idx=0)
             ckpt_total = meta.get("total_jobs", 0)
             if ckpt_total != total_expected:
                 logger.warning(
@@ -1300,7 +1372,17 @@ def _load_or_run_stage(
                 logger.info("Stage %s: loading complete checkpoint (%d records)", stage_name, len(records))
                 return records
 
-        # Partial checkpoint -- resume from last record
+        # Partial checkpoint -- check fingerprint before resuming
+        meta_partial, _ = load_checkpoint(path)
+        ckpt_fp = meta_partial.get("fingerprint")
+        if fingerprint and ckpt_fp != fingerprint:
+            logger.warning(
+                "Partial checkpoint %s fingerprint mismatch or missing fingerprint; "
+                "rerunning from scratch",
+                stage_name,
+            )
+            return run_fn(start_idx=0)
+
         existing = count_checkpoint_records(path)
         if existing > 0:
             logger.info("Stage %s: resuming from record %d", stage_name, existing)
@@ -1700,10 +1782,12 @@ def run_pipeline(
     progress_callback(item_idx, total_items, stage, detail, extra) is called during run.
     Returns (augmented_jobs, paths_dict, run_stats).
     """
+    from .checkpoint import set_flush_interval
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir = output_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+    set_flush_interval(cfg.checkpoint_flush_interval)
     started = dt.datetime.now(dt.timezone.utc).isoformat()
 
     stats = RunStats(
@@ -1758,6 +1842,43 @@ def run_pipeline(
     # )
     # stats.record_stage_end("stage0_preprocessed")
 
+    # Compute per-stage fingerprints for checkpoint invalidation
+    from .prompts import (
+        EXTRACTOR_V2_SYSTEM, EXTRACTOR_V2_USER_TEMPLATE,
+        HARDSOFT_CLASSIFIER_SYSTEM, HARDSOFT_CLASSIFIER_USER_TEMPLATE,
+        REQUIREMENT_CLASSIFIER_SYSTEM, REQUIREMENT_CLASSIFIER_USER_TEMPLATE,
+        SKILL_VERIFIER_SYSTEM, SKILL_VERIFIER_USER_TEMPLATE,
+    )
+    fp_s1 = compute_stage_fingerprint(
+        "stage1", cfg.extractor_model, cfg.backend,
+        [EXTRACTOR_V2_SYSTEM, EXTRACTOR_V2_USER_TEMPLATE],
+        pipeline_version=cfg.pipeline_version,
+    )
+    fp_s2 = compute_stage_fingerprint(
+        "stage2", cfg.verifier_model, cfg.backend,
+        [SKILL_VERIFIER_SYSTEM, SKILL_VERIFIER_USER_TEMPLATE],
+        upstream_fingerprint=fp_s1,
+        pipeline_version=cfg.pipeline_version,
+    )
+    fp_s3 = compute_stage_fingerprint(
+        "stage3", cfg.requirement_model, cfg.backend,
+        [REQUIREMENT_CLASSIFIER_SYSTEM, REQUIREMENT_CLASSIFIER_USER_TEMPLATE],
+        upstream_fingerprint=fp_s2,
+        pipeline_version=cfg.pipeline_version,
+    )
+    fp_s4 = compute_stage_fingerprint(
+        "stage4", cfg.hardsoft_model, cfg.backend,
+        [HARDSOFT_CLASSIFIER_SYSTEM, HARDSOFT_CLASSIFIER_USER_TEMPLATE],
+        upstream_fingerprint=fp_s2,
+        pipeline_version=cfg.pipeline_version,
+    )
+
+    # Store fingerprints so stage functions can embed them in checkpoint headers
+    _stage_fingerprints["stage1_extracted"] = fp_s1
+    _stage_fingerprints["stage2_verified"] = fp_s2
+    _stage_fingerprints["stage3_requirement"] = fp_s3
+    _stage_fingerprints["stage4_hardsoft"] = fp_s4
+
     # --- Stage 1: Extract (one LLM call per job) ---
     stats.record_stage_start("stage1_extracted")
     stage1_data = _load_or_run_stage(
@@ -1766,6 +1887,7 @@ def run_pipeline(
             jobs, cfg, run_id, ckpt_dir, progress_callback, stats, start_idx=start_idx,
         ),
         progress_cb=progress_callback,
+        fingerprint=fp_s1,
     )
     stats.record_stage_end("stage1_extracted")
 
@@ -1783,6 +1905,7 @@ def run_pipeline(
             start_idx=start_idx,
         ),
         progress_cb=progress_callback,
+        fingerprint=fp_s2,
     )
     stats.record_stage_end("stage2_verified")
 
@@ -1795,6 +1918,7 @@ def run_pipeline(
             stats, start_idx=start_idx,
         ),
         progress_cb=progress_callback,
+        fingerprint=fp_s3,
     )
     stats.record_stage_end("stage3_requirement")
 
@@ -1807,6 +1931,7 @@ def run_pipeline(
             stats, start_idx=start_idx,
         ),
         progress_cb=progress_callback,
+        fingerprint=fp_s4,
     )
     stats.record_stage_end("stage4_hardsoft")
 
@@ -1820,9 +1945,12 @@ def run_pipeline(
 
     cfg.llm_timing_callback = original_timing
 
+    # A job is "successful" if it assembled without a pipeline execution error.
+    # Zero mentions is valid. Stage-level extraction failures propagate into
+    # extraction_metadata.error so they are not counted as successes.
     stats.jobs_success = sum(
         1 for j in augmented
-        if not j.get("extraction_metadata", {}).get("error")
+        if not (j.get("extraction_metadata") or {}).get("error")
     )
     stats.jobs_failed = stats.jobs_total - stats.jobs_success
     stats.mentions_total = sum(
@@ -1835,7 +1963,7 @@ def run_pipeline(
     paths["mentions_jsonl"] = output_dir / f"SkillsExtraction_mentions_run_{run_id}.jsonl"
     paths["mentions_csv"] = output_dir / f"SkillsExtraction_mentions_run_{run_id}.csv"
 
-    write_augmented_jobs(paths["augmented_json"], augmented)
+    write_augmented_jobs(paths["augmented_json"], augmented, pretty=cfg.export_pretty_json)
     write_mentions_jsonl(paths["mentions_jsonl"], augmented)
     write_mentions_csv(paths["mentions_csv"], augmented)
 

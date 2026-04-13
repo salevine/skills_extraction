@@ -22,7 +22,7 @@ def test_stage5_authority():
     from skills_extraction.pipeline import _run_stage5_assemble, _mention_is_skill
     from skills_extraction.config import PipelineConfig
     from skills_extraction.schemas import ParsedLine
-    from skills_extraction.checkpoint import serialize_mention
+    from skills_extraction.checkpoint import serialize_mentions_for_job
 
     cfg = PipelineConfig(
         skip_llm=True,
@@ -58,12 +58,14 @@ def test_stage5_authority():
     }
 
     # Build stage1_data with the mention
+    ser_mentions, lines_reg = serialize_mentions_for_job([mention])
     jobs = [{"JobTitle": "Test", "Description": pl.text}]
     stage1_data = [{
         "job_index": 0,
         "job_key": "testjob",
         "extractor_model_used": "test-model",
-        "raw_mentions": [serialize_mention(mention)],
+        "raw_mentions": ser_mentions,
+        "_parsed_lines": lines_reg,
     }]
 
     # Stage 2 REJECTED the mention
@@ -126,7 +128,7 @@ def test_stage5_classifier_authority():
     from skills_extraction.pipeline import _run_stage5_assemble
     from skills_extraction.config import PipelineConfig
     from skills_extraction.schemas import ParsedLine
-    from skills_extraction.checkpoint import serialize_mention
+    from skills_extraction.checkpoint import serialize_mentions_for_job
 
     cfg = PipelineConfig(
         skip_llm=True,
@@ -157,11 +159,13 @@ def test_stage5_classifier_authority():
         "_parsed_line": pl,
     }
 
+    ser_mentions, lines_reg = serialize_mentions_for_job([mention])
     jobs = [{"JobTitle": "Test2", "Description": pl.text}]
     stage1_data = [{
         "job_index": 0, "job_key": "testjob2",
         "extractor_model_used": "test-model",
-        "raw_mentions": [serialize_mention(mention)],
+        "raw_mentions": ser_mentions,
+        "_parsed_lines": lines_reg,
     }]
     stage2_data = [{
         "job_index": 0, "job_key": "testjob2", "mention_idx": 0,
@@ -293,7 +297,7 @@ def test_offsets_match_normalized():
     from skills_extraction.pipeline import _run_stage5_assemble
     from skills_extraction.config import PipelineConfig
     from skills_extraction.schemas import ParsedLine
-    from skills_extraction.checkpoint import serialize_mention
+    from skills_extraction.checkpoint import serialize_mentions_for_job
     from skills_extraction.preprocessing import preprocess_description
     from skills_extraction.sectioning import split_inline_section_headers
 
@@ -337,11 +341,13 @@ def test_offsets_match_normalized():
         "_parsed_line": pl,
     }
 
+    ser_mentions, lines_reg = serialize_mentions_for_job([mention])
     jobs = [{"JobTitle": "Offset Test", "Description": raw}]
     stage1_data = [{
         "job_index": 0, "job_key": "offset_test",
         "extractor_model_used": "test-model",
-        "raw_mentions": [serialize_mention(mention)],
+        "raw_mentions": ser_mentions,
+        "_parsed_lines": lines_reg,
     }]
     stage2_data = [{"job_index": 0, "job_key": "offset_test", "mention_idx": 0,
                     "verifier_output": {"status": "skipped"}}]
@@ -486,6 +492,362 @@ def test_rolling_bounded():
 
 
 # ---------------------------------------------------------------------------
+# Test 9: Classifier role strings are distinct from verifier
+# ---------------------------------------------------------------------------
+
+def test_classifier_role_strings():
+    """Stage 3/4 classifiers must pass distinct role names through call_llm,
+    not reuse 'verifier', so timing stats can distinguish them."""
+    import ast
+    from pathlib import Path
+
+    pkg = Path("skills_extraction")
+    req_src = (pkg / "llm_requirement_classifier.py").read_text()
+    hs_src = (pkg / "llm_hardsoft_classifier.py").read_text()
+
+    assert 'role="requirement_classifier"' in req_src, (
+        "FAIL: llm_requirement_classifier still uses wrong role string"
+    )
+    assert 'role="hardsoft_classifier"' in hs_src, (
+        "FAIL: llm_hardsoft_classifier still uses wrong role string"
+    )
+    assert 'role="verifier"' not in req_src, (
+        "FAIL: llm_requirement_classifier still contains role='verifier'"
+    )
+    assert 'role="verifier"' not in hs_src, (
+        "FAIL: llm_hardsoft_classifier still contains role='verifier'"
+    )
+    print("PASS: test_classifier_role_strings")
+
+
+# ---------------------------------------------------------------------------
+# Test 10: Zero-mention job counts as success, not failure
+# ---------------------------------------------------------------------------
+
+def test_zero_mention_job_is_success():
+    """A job that produces zero skill mentions should still count as
+    jobs_success (the pipeline completed normally), not jobs_failed."""
+    from skills_extraction.pipeline import _run_stage5_assemble
+    from skills_extraction.config import PipelineConfig
+
+    cfg = PipelineConfig(
+        skip_llm=True,
+        verifier_enabled=False,
+        requirement_classifier_enabled=False,
+        hardsoft_classifier_enabled=False,
+    )
+
+    # Job with a description that yields zero mentions
+    jobs = [{"JobTitle": "Empty Test", "Description": "This is a test job with no skills."}]
+    stage1_data = [{
+        "job_index": 0, "job_key": "zero_mention_test",
+        "extractor_model_used": "test-model",
+        "raw_mentions": [],  # zero mentions
+    }]
+    stage2_data = []
+    stage3_data = []
+    stage4_data = []
+
+    augmented = _run_stage5_assemble(
+        jobs, stage1_data, stage2_data, stage3_data, stage4_data,
+        cfg, "zero_test_run", "2026-01-01T00:00:00Z",
+    )
+
+    assert len(augmented) == 1, f"FAIL: expected 1 augmented job, got {len(augmented)}"
+    job_out = augmented[0]
+    assert job_out.get("skill_mentions") == [], (
+        f"FAIL: expected empty skill_mentions, got {job_out.get('skill_mentions')}"
+    )
+    assert not (job_out.get("extraction_metadata") or {}).get("error"), (
+        f"FAIL: zero-mention job should not carry an error, got {job_out.get('extraction_metadata')}"
+    )
+
+    # Simulate the stats accounting from run_pipeline
+    jobs_success = sum(
+        1 for j in augmented
+        if not (j.get("extraction_metadata") or {}).get("error")
+    )
+    jobs_failed = len(jobs) - jobs_success
+    assert jobs_success == 1, f"FAIL: zero-mention job should be success, got {jobs_success}"
+    assert jobs_failed == 0, f"FAIL: zero-mention job should not be failed, got {jobs_failed}"
+    print("PASS: test_zero_mention_job_is_success")
+
+
+# ---------------------------------------------------------------------------
+# Test 11: Stage-1 extraction failure counts as failed job
+# ---------------------------------------------------------------------------
+
+def test_stage1_error_job_is_failed():
+    """A job with an explicit stage-1 extraction error should assemble, but it
+    must be counted as failed and carry the error into extraction_metadata."""
+    from skills_extraction.pipeline import _run_stage5_assemble
+    from skills_extraction.config import PipelineConfig
+
+    cfg = PipelineConfig(
+        skip_llm=True,
+        verifier_enabled=False,
+        requirement_classifier_enabled=False,
+        hardsoft_classifier_enabled=False,
+    )
+
+    jobs = [{"JobTitle": "Failed Extract", "Description": "Python preferred."}]
+    stage1_data = [{
+        "job_index": 0,
+        "job_key": "stage1_failed_job",
+        "extractor_model_used": "test-model",
+        "raw_mentions": [],
+        "stage1_error": "extractor_json_parse_failed: stage1_failed_job: bad payload",
+    }]
+
+    augmented = _run_stage5_assemble(
+        jobs, stage1_data, [], [], [],
+        cfg, "failed_job_run", "2026-01-01T00:00:00Z",
+    )
+
+    assert len(augmented) == 1, f"FAIL: expected 1 augmented job, got {len(augmented)}"
+    job_out = augmented[0]
+    error = (job_out.get("extraction_metadata") or {}).get("error")
+    assert error, "FAIL: stage1 failure should propagate into extraction_metadata.error"
+
+    jobs_success = sum(
+        1 for j in augmented
+        if not (j.get("extraction_metadata") or {}).get("error")
+    )
+    jobs_failed = len(jobs) - jobs_success
+    assert jobs_success == 0, f"FAIL: stage1-failed job should not be success, got {jobs_success}"
+    assert jobs_failed == 1, f"FAIL: stage1-failed job should count as failed, got {jobs_failed}"
+    print("PASS: test_stage1_error_job_is_failed")
+
+
+# ---------------------------------------------------------------------------
+# Test 12: ParsedLine dedup in checkpoint serialization
+# ---------------------------------------------------------------------------
+
+def test_checkpoint_parsed_line_dedup():
+    """serialize_mentions_for_job should deduplicate ParsedLine data into a
+    registry, and deserialize_mentions_for_job should reconstruct correctly."""
+    from skills_extraction.schemas import ParsedLine
+    from skills_extraction.checkpoint import (
+        serialize_mentions_for_job, deserialize_mentions_for_job,
+    )
+
+    pl = ParsedLine(
+        line_id="dedup_L0001", section="requirements",
+        text="Python and SQL required.", char_start=0, char_end=24,
+        boilerplate_label="skills_relevant", line_index=0,
+    )
+    mentions = [
+        {"skill_span": "Python", "_parsed_line": pl, "_glob_char_start": 0, "_glob_char_end": 6},
+        {"skill_span": "SQL", "_parsed_line": pl, "_glob_char_start": 11, "_glob_char_end": 14},
+    ]
+
+    ser, registry = serialize_mentions_for_job(mentions)
+
+    # Registry should have exactly 1 entry (both mentions share the same line)
+    assert len(registry) == 1, f"FAIL: expected 1 registry entry, got {len(registry)}"
+    assert "dedup_L0001" in registry
+
+    # Serialized mentions should NOT have _parsed_line_dict (only _parsed_line_id)
+    for s in ser:
+        assert "_parsed_line_dict" not in s, "FAIL: serialized mention still has full _parsed_line_dict"
+        assert "_parsed_line_id" in s
+
+    # Deserialize and check reconstruction
+    restored = deserialize_mentions_for_job(ser, registry)
+    assert len(restored) == 2
+    for r in restored:
+        assert "_parsed_line" in r
+        assert r["_parsed_line"].line_id == "dedup_L0001"
+        assert r["_parsed_line"].text == "Python and SQL required."
+
+    print("PASS: test_checkpoint_parsed_line_dedup")
+
+
+# ---------------------------------------------------------------------------
+# Test 13: Backward compat — old checkpoints with inline _parsed_line_dict
+# ---------------------------------------------------------------------------
+
+def test_checkpoint_backward_compat():
+    """Older checkpoints that embed _parsed_line_dict per mention (no registry)
+    must still deserialize correctly."""
+    from skills_extraction.schemas import ParsedLine
+    from skills_extraction.checkpoint import deserialize_mentions_for_job
+
+    # Simulate old format: _parsed_line_dict inline, no registry
+    old_format_mention = {
+        "skill_span": "Java",
+        "_parsed_line_dict": {
+            "line_id": "old_L0001", "section": "body",
+            "text": "Java required.", "char_start": 0, "char_end": 14,
+            "boilerplate_label": "skills_relevant", "line_index": 0,
+        },
+        "_parsed_line_id": "old_L0001",
+    }
+
+    restored = deserialize_mentions_for_job([old_format_mention], None)
+    assert len(restored) == 1
+    m = restored[0]
+    assert "_parsed_line" in m
+    assert m["_parsed_line"].line_id == "old_L0001"
+    assert m["_parsed_line"].text == "Java required."
+    print("PASS: test_checkpoint_backward_compat")
+
+
+# ---------------------------------------------------------------------------
+# Test 14: Batched flushing
+# ---------------------------------------------------------------------------
+
+def test_batched_flush():
+    """With flush_interval > 1, flushes happen every N records, not every record."""
+    import io
+    from skills_extraction.checkpoint import (
+        set_flush_interval, append_checkpoint_record, flush_checkpoint,
+    )
+
+    flush_count = [0]
+    class CountingWriter(io.StringIO):
+        def flush(self):
+            flush_count[0] += 1
+            super().flush()
+
+    fh = CountingWriter()
+    set_flush_interval(4)
+    flush_count[0] = 0
+
+    try:
+        for i in range(10):
+            append_checkpoint_record(fh, {"idx": i})
+
+        # With interval=4 and 10 records: expect floor(10/4) = 2 flushes
+        assert flush_count[0] == 2, f"FAIL: expected 2 flushes, got {flush_count[0]}"
+
+        # Force flush should add one more
+        flush_checkpoint(fh)
+        assert flush_count[0] == 3, f"FAIL: expected 3 after force flush, got {flush_count[0]}"
+    finally:
+        set_flush_interval(1)  # restore default
+
+    print("PASS: test_batched_flush")
+
+
+# ---------------------------------------------------------------------------
+# Test 15: Fingerprint mismatch invalidates checkpoint
+# ---------------------------------------------------------------------------
+
+def test_fingerprint_mismatch_invalidates():
+    """_load_or_run_stage should rerun from scratch when fingerprint mismatches."""
+    import tempfile, shutil
+    from pathlib import Path
+    from skills_extraction.pipeline import _load_or_run_stage
+    from skills_extraction.checkpoint import (
+        write_checkpoint_header, write_checkpoint_footer, append_checkpoint_record,
+    )
+
+    tmpdir = Path(tempfile.mkdtemp())
+    try:
+        ckpt_dir = tmpdir / "checkpoints"
+        ckpt_dir.mkdir()
+
+        # Write a complete checkpoint with fingerprint "OLD_FP"
+        from skills_extraction.checkpoint import checkpoint_path
+        path = checkpoint_path(tmpdir, "test_run", "test_stage")
+        with open(path, "w") as fh:
+            write_checkpoint_header(fh, "test_run", "test_stage", 2, fingerprint="OLD_FP_1234567890")
+            append_checkpoint_record(fh, {"idx": 0, "data": "old"})
+            append_checkpoint_record(fh, {"idx": 1, "data": "old"})
+            write_checkpoint_footer(fh, 2)
+
+        run_count = [0]
+        def _run_fn(start_idx=0):
+            run_count[0] += 1
+            return [{"idx": 0, "data": "new"}, {"idx": 1, "data": "new"}]
+
+        # Same fingerprint — should load from checkpoint, not rerun
+        result = _load_or_run_stage(
+            "test_stage", ckpt_dir, "test_run", resume=True, total_expected=2,
+            run_fn=_run_fn, fingerprint="OLD_FP_1234567890",
+        )
+        assert run_count[0] == 0, f"FAIL: should have loaded checkpoint, but ran {run_count[0]} times"
+        assert result[0]["data"] == "old"
+
+        # Different fingerprint — should invalidate and rerun
+        result = _load_or_run_stage(
+            "test_stage", ckpt_dir, "test_run", resume=True, total_expected=2,
+            run_fn=_run_fn, fingerprint="NEW_FP_0987654321",
+        )
+        assert run_count[0] == 1, f"FAIL: should have rerun, but ran {run_count[0]} times"
+        assert result[0]["data"] == "new"
+
+        print("PASS: test_fingerprint_mismatch_invalidates")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+# ---------------------------------------------------------------------------
+# Test 16: Missing fingerprint invalidates older checkpoint
+# ---------------------------------------------------------------------------
+
+def test_missing_fingerprint_invalidates():
+    """Older checkpoints without a fingerprint must be invalidated when the
+    current stage requires one."""
+    import tempfile, shutil
+    from pathlib import Path
+    from skills_extraction.pipeline import _load_or_run_stage
+    from skills_extraction.checkpoint import (
+        append_checkpoint_record, checkpoint_path, write_checkpoint_footer, write_checkpoint_header,
+    )
+
+    tmpdir = Path(tempfile.mkdtemp())
+    try:
+        ckpt_dir = tmpdir / "checkpoints"
+        ckpt_dir.mkdir()
+        path = checkpoint_path(tmpdir, "test_run", "test_stage")
+        with open(path, "w") as fh:
+            write_checkpoint_header(fh, "test_run", "test_stage", 1)
+            append_checkpoint_record(fh, {"idx": 0, "data": "old"})
+            write_checkpoint_footer(fh, 1)
+
+        run_count = [0]
+        def _run_fn(start_idx=0):
+            run_count[0] += 1
+            return [{"idx": 0, "data": "new"}]
+
+        result = _load_or_run_stage(
+            "test_stage", ckpt_dir, "test_run", resume=True, total_expected=1,
+            run_fn=_run_fn, fingerprint="FP_PRESENT_123456",
+        )
+        assert run_count[0] == 1, "FAIL: missing fingerprint should invalidate old checkpoint"
+        assert result[0]["data"] == "new"
+        print("PASS: test_missing_fingerprint_invalidates")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+# ---------------------------------------------------------------------------
+# Test 17: Fingerprint changes when model or user prompt changes
+# ---------------------------------------------------------------------------
+
+def test_fingerprint_changes_with_model():
+    """Changing the model name or prompt text must produce a different fingerprint."""
+    from skills_extraction.checkpoint import compute_stage_fingerprint
+
+    fp1 = compute_stage_fingerprint("stage1", "qwen3:14b", "vllm", ["prompt text"])
+    fp2 = compute_stage_fingerprint("stage1", "qwen3:32b", "vllm", ["prompt text"])
+    fp3 = compute_stage_fingerprint("stage1", "qwen3:14b", "vllm", ["different prompt"])
+    fp4 = compute_stage_fingerprint("stage2", "mistral-nemo:12b", "vllm", ["system", "user v1"])
+    fp5 = compute_stage_fingerprint("stage2", "mistral-nemo:12b", "vllm", ["system", "user v2"])
+
+    assert fp1 != fp2, "FAIL: different models should produce different fingerprints"
+    assert fp1 != fp3, "FAIL: different prompts should produce different fingerprints"
+    assert fp4 != fp5, "FAIL: different user templates should produce different fingerprints"
+    # Same inputs should be deterministic
+    fp1b = compute_stage_fingerprint("stage1", "qwen3:14b", "vllm", ["prompt text"])
+    assert fp1 == fp1b, "FAIL: same inputs should produce same fingerprint"
+
+    print("PASS: test_fingerprint_changes_with_model")
+
+
+# ---------------------------------------------------------------------------
 # Run all
 # ---------------------------------------------------------------------------
 
@@ -499,6 +861,15 @@ if __name__ == "__main__":
         ("test_offsets_match_normalized", test_offsets_match_normalized),
         ("test_thread_local_sessions", test_thread_local_sessions),
         ("test_rolling_bounded", test_rolling_bounded),
+        ("test_classifier_role_strings", test_classifier_role_strings),
+        ("test_zero_mention_job_is_success", test_zero_mention_job_is_success),
+        ("test_stage1_error_job_is_failed", test_stage1_error_job_is_failed),
+        ("test_checkpoint_parsed_line_dedup", test_checkpoint_parsed_line_dedup),
+        ("test_checkpoint_backward_compat", test_checkpoint_backward_compat),
+        ("test_batched_flush", test_batched_flush),
+        ("test_fingerprint_mismatch_invalidates", test_fingerprint_mismatch_invalidates),
+        ("test_missing_fingerprint_invalidates", test_missing_fingerprint_invalidates),
+        ("test_fingerprint_changes_with_model", test_fingerprint_changes_with_model),
     ]
 
     failures = 0

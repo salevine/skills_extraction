@@ -16,7 +16,7 @@ from .candidate_mining import CandidateSpan
 from .config import PipelineConfig
 from .llm_backend import call_llm
 from .llm_ollama import parse_json_loose
-from .llm_vllm import call_vllm_direct
+from .llm_vllm import call_vllm_direct, call_vllm_direct_with_failover
 from .preprocessing import extract_description_fields, preprocess_description
 from .prompts import (
     EXTRACTOR_SYSTEM,
@@ -174,6 +174,7 @@ def extract_mentions_for_job(
     job_key: str,
     model: Optional[str] = None,
     endpoint: Optional[str] = None,
+    all_endpoints: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Extract skill mentions from a full job description in a single LLM call.
 
@@ -186,7 +187,8 @@ def extract_mentions_for_job(
         job: Raw job record (must contain a description field).
         job_key: Stable key for this job.
         model: Override model name (defaults to cfg.extractor_model).
-        endpoint: If provided, call this vLLM endpoint directly.
+        endpoint: If provided, preferred vLLM endpoint.
+        all_endpoints: If provided with endpoint, enables failover to other nodes.
     """
     model = model or cfg.extractor_model
     _title, desc_raw = extract_description_fields(job)
@@ -195,7 +197,11 @@ def extract_mentions_for_job(
 
     user = EXTRACTOR_V2_USER_TEMPLATE.format(description=desc_raw)
 
-    if endpoint:
+    if endpoint and all_endpoints:
+        raw = call_vllm_direct_with_failover(
+            cfg, endpoint, all_endpoints, model, EXTRACTOR_V2_SYSTEM, user, temperature=0.1,
+        )
+    elif endpoint:
         raw = call_vllm_direct(cfg, endpoint, model, EXTRACTOR_V2_SYSTEM, user, temperature=0.1)
     else:
         raw = call_llm(cfg, model, EXTRACTOR_V2_SYSTEM, user, temperature=0.1)
@@ -203,14 +209,13 @@ def extract_mentions_for_job(
     try:
         data = parse_json_loose(raw)
     except Exception as e:
-        logger.error("Extractor JSON parse failed for %s: %s", job_key, e)
-        return []
+        raise RuntimeError(f"extractor_json_parse_failed: {job_key}: {e}") from e
 
     mentions = data.get("mentions") if isinstance(data, dict) else None
     if mentions is None and isinstance(data, list):
         mentions = data
     if not isinstance(mentions, list):
-        return []
+        raise RuntimeError(f"extractor_invalid_payload: {job_key}: missing mentions list")
 
     # Build real parsed lines from the source text
     source_lines = _build_source_lines(job_key, desc_raw)

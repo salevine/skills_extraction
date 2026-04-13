@@ -28,7 +28,7 @@ def classify_hard_soft(
         mention_json=json.dumps(mention_dict, ensure_ascii=False),
     )
     raw = call_llm(
-        cfg, model, HARDSOFT_CLASSIFIER_SYSTEM, user, temperature=0.05, role="verifier"
+        cfg, model, HARDSOFT_CLASSIFIER_SYSTEM, user, temperature=0.05, role="hardsoft_classifier"
     )
     try:
         data = parse_json_loose(raw)
