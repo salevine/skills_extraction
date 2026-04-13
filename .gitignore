@@ -8,6 +8,7 @@ venv/
 .env.local
 
 # Outputs
+out/
 skills_extraction_output/
 _skills_test_out/
 test_*/
