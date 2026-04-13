@@ -9,6 +9,11 @@ cd ~/skills_extraction
 
 echo "=== Full pipeline run — $(date) ==="
 
+# Pick a single run id up front and carry it through both phases.
+# Allow override via env for scripted restarts if needed.
+RUN_ID="${RUN_ID:-full_$(date +%Y%m%d_%H%M%S)}"
+echo "=== Run ID: $RUN_ID ==="
+
 # ------------------------------------------------------------------
 # Stage 1: Extract with Qwen (assumes Qwen vLLM servers already running)
 # Start them first if needed:  ~/startQwen 8
@@ -29,6 +34,7 @@ echo "=== Stages 0-1: Extraction (Qwen/Qwen3-14B) ==="
 conda run --no-capture-output -n skills python -m skills_extraction \
   --input ../jobs/SampleJobs.json \
   --output-dir ./out \
+  --run-id "$RUN_ID" \
   --vllm \
   --vllm-host localhost \
   --vllm-base-port 8000 \
@@ -38,9 +44,8 @@ conda run --no-capture-output -n skills python -m skills_extraction \
   --no-requirement-classifier \
   --no-hardsoft-classifier
 
-LAST_RUN=$(ls -t out/checkpoints/*_stage1_extracted.jsonl | head -1 | xargs basename | sed 's/_stage1_extracted.jsonl//')
 echo ""
-echo "=== Stage 1 complete. Run ID: $LAST_RUN ==="
+echo "=== Stage 1 complete. Run ID: $RUN_ID ==="
 echo "=== Swapping to Mistral-Nemo ==="
 
 # ------------------------------------------------------------------
@@ -73,13 +78,13 @@ done
 # Stages 2-4: Verify + classify with Mistral-Nemo
 # ------------------------------------------------------------------
 echo ""
-echo "=== Stages 2-4: Verify + Classify (Mistral-Nemo) — resuming run $LAST_RUN ==="
+echo "=== Stages 2-4: Verify + Classify (Mistral-Nemo) — resuming run $RUN_ID ==="
 conda run --no-capture-output -n skills python -m skills_extraction \
   --input ../jobs/SampleJobs.json \
   --output-dir ./out \
   --vllm \
   --vllm-host localhost \
-  --run-id "$LAST_RUN" \
+  --run-id "$RUN_ID" \
   --vllm-base-port 8000 \
   --vllm-num-endpoints 8 \
   --extractor-model "Qwen/Qwen3-14B" \
@@ -89,7 +94,7 @@ conda run --no-capture-output -n skills python -m skills_extraction \
 
 echo ""
 echo "=== Pipeline complete — $(date) ==="
-echo "=== Run ID: $LAST_RUN ==="
+echo "=== Run ID: $RUN_ID ==="
 
 # Show status
-./check_status.sh "$LAST_RUN"
+./check_status.sh "$RUN_ID"
