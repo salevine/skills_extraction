@@ -5,6 +5,28 @@ This file is the canonical changelog for the skills-extraction project.
 
 ---
 
+## [3.2.2] — 2026-04-12 — Checkpoint resilience, status tooling, Windows deploy
+
+### Checkpoint error handling
+
+- **Problem:** A single corrupt or NUL-byte line in a checkpoint file caused `load_checkpoint()` to crash with `JSONDecodeError`, preventing pipeline resume even when 99%+ of the checkpoint was valid.
+- **Fix:** `load_checkpoint()` now strips NUL bytes, wraps `json.loads()` in try/except, and logs a warning for each skipped line. The pipeline continues with all valid records.
+
+### Operational tooling
+
+- **`check_status.sh`:** Comprehensive run status report. Usage: `./check_status.sh` (all runs) or `./check_status.sh <RUN_ID>` (single run). Reports:
+  - Per-stage status (COMPLETE/INCOMPLETE) with record counts and timestamps
+  - Error counts per stage (`"status": "error"` records)
+  - Models and backend config from checkpoint headers
+  - Progress percentage for incomplete stages
+  - Active process detection (`pgrep`)
+  - Run summary (wall clock, mentions, LLM timing) from `run_summary.json` if available
+  - Last 5 lines of the run's log file
+- **`deploy.ps1`:** Windows PowerShell deployment script (replaces Mac-only `deploy.sh`). Uses rsync over SSH, supports `-s` flag to copy SampleJobs.json.
+- **`deploy.bat`:** Windows cmd.exe alternative for environments without PowerShell.
+
+---
+
 ## [3.2.1] — 2026-04-02 — vLLM deadlock fix, thinking suppression, server deployment
 
 ### Bug fix: Stage 1 vLLM deadlock
