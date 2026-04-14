@@ -71,11 +71,15 @@ def _build_vllm_payload(
             {"role": "user", "content": user_text},
         ],
         "temperature": temperature,
+        "max_tokens": 4096,
         "stream": False,
     }
     if cfg.disable_thinking and _is_qwen_model(model):
         payload["messages"][1]["content"] = _append_no_think_suffix(user_text)
         payload["chat_template_kwargs"] = {"enable_thinking": False}
+        # Ban the <think> token (ID 151667) to prevent reasoning output
+        # at the logit level — the only reliable method for Qwen3 on vLLM.
+        payload["logit_bias"] = {"151667": -100}
     return payload
 
 
