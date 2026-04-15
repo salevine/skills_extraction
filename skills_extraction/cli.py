@@ -25,6 +25,24 @@ logger = logging.getLogger(__name__)
 _PROGRESS_START = time.perf_counter()
 
 
+def _find_latest_run_id(ckpt_dir: Path) -> str:
+    """Find the most recent run_id from checkpoint filenames."""
+    if not ckpt_dir.exists():
+        return ""
+    import re
+    run_ids: dict[str, float] = {}
+    for f in ckpt_dir.glob("*.jsonl"):
+        m = re.match(r"^(.+?)_stage\d+_\w+\.jsonl$", f.name)
+        if m:
+            rid = m.group(1)
+            mtime = f.stat().st_mtime
+            if rid not in run_ids or mtime > run_ids[rid]:
+                run_ids[rid] = mtime
+    if not run_ids:
+        return ""
+    return max(run_ids, key=run_ids.get)
+
+
 def _format_eta(remaining_sec: float) -> str:
     """Format seconds as e.g. '2m 15s' or '45s'."""
     if remaining_sec <= 0 or not (remaining_sec < 86400):
@@ -87,6 +105,7 @@ Examples (run from repository root — the folder that contains `skills_extracti
     parser.add_argument("--skip-llm", action="store_true", help="Skip Ollama (structure + candidates only)")
     parser.add_argument("--no-reports", action="store_true", help="Skip derived CSV summary reports")
     parser.add_argument("--no-resume", action="store_true", help="Ignore existing checkpoints; overwrite from scratch")
+    parser.add_argument("--resume-latest", action="store_true", help="Resume the most recent run from checkpoints")
     parser.add_argument("--backend", choices=["ollama", "openrouter", "vllm"], default="", help="LLM backend (default: ollama, or SKILLS_BACKEND env)")
     parser.add_argument("--batch-lines", type=int, default=5, help="Max lines per extractor LLM call")
     parser.add_argument("--context-size", type=int, default=32768, help="Ollama num_ctx")
@@ -100,7 +119,13 @@ Examples (run from repository root — the folder that contains `skills_extracti
     args = parser.parse_args()
 
     label = args.run_id.strip()
-    if label and not args.no_resume:
+    if args.resume_latest:
+        run_id = _find_latest_run_id(Path(args.output_dir) / "checkpoints")
+        if not run_id:
+            print("ERROR: --resume-latest: no checkpoint files found in", Path(args.output_dir) / "checkpoints")
+            sys.exit(1)
+        print(f"Resuming latest run: {run_id}")
+    elif label and not args.no_resume:
         # When resuming with an explicit run-id, use it as-is so checkpoints match
         run_id = label
     else:

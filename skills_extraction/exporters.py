@@ -153,6 +153,45 @@ def write_frequency_report(path: Path, jobs: List[Dict[str, Any]], min_count: in
     path.write_text("\n".join(rows), encoding="utf-8")
 
 
+def write_job_skills_summary(path: Path, jobs: List[Dict[str, Any]]) -> None:
+    """Write a clean CSV of verified skills per job: normalized title, skill, confidence."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "job_id",
+        "title_norm",
+        "normalized_skill",
+        "final_confidence",
+        "hard_soft",
+        "requirement_level",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for job in jobs:
+            job_id = job.get("id")
+            title_norm = (
+                job.get("title_norm")
+                or job.get("JobTitle")
+                or job.get("title_raw")
+                or job.get("title")
+                or ""
+            )
+            for m in job.get("skill_mentions") or []:
+                if not m.get("is_skill"):
+                    continue
+                w.writerow({
+                    "job_id": job_id,
+                    "title_norm": title_norm,
+                    "normalized_skill": (
+                        m.get("normalized_candidate") or m.get("skill_span") or ""
+                    ),
+                    "final_confidence": m.get("final_confidence", ""),
+                    "hard_soft": m.get("hard_soft", ""),
+                    "requirement_level": m.get("requirement_level", ""),
+                })
+    logger.info("Wrote job-skills summary: %s", path)
+
+
 def write_low_confidence_review(path: Path, jobs: List[Dict[str, Any]], threshold: float = 0.55) -> None:
     out: List[Dict[str, Any]] = []
     for job in jobs:

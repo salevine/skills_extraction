@@ -36,6 +36,7 @@ from .config import PipelineConfig
 from .exporters import (
     write_augmented_jobs,
     write_frequency_report,
+    write_job_skills_summary,
     write_low_confidence_review,
     write_mentions_csv,
     write_mentions_jsonl,
@@ -1987,6 +1988,9 @@ def run_pipeline(
         write_quality_report(paths["quality_csv"], augmented)
         write_frequency_report(paths["frequency_csv"], augmented)
         write_low_confidence_review(paths["low_conf_json"], augmented, threshold=0.55)
+
+    paths["job_skills_csv"] = output_dir / f"SkillsExtraction_job_skills_run_{run_id}.csv"
+    write_job_skills_summary(paths["job_skills_csv"], augmented)
 
     if log_path:
         try:

@@ -30,9 +30,33 @@ echo "=== Stage 1 complete. Swapping models... ==="
 sleep 5
 ./startMistral 8
 
-# Wait for Mistral-Nemo to be ready
-echo "Waiting for Mistral-Nemo to load..."
-sleep 60
+# Wait for ALL Mistral-Nemo endpoints to be ready (retry with backoff)
+PORTS="8000 8001 8002 8003 8004 8005 8006 8007"
+MAX_RETRIES=12
+RETRY_DELAY=15
+
+echo "Waiting for Mistral-Nemo to load on all ports..."
+sleep 30  # initial pause for model loading
+
+for port in $PORTS; do
+  attempt=0
+  while [ $attempt -lt $MAX_RETRIES ]; do
+    status=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:$port/v1/models)
+    if [ "$status" = "200" ]; then
+      echo "  Port $port: ready"
+      break
+    fi
+    attempt=$((attempt + 1))
+    echo "  Port $port: not ready (attempt $attempt/$MAX_RETRIES), waiting ${RETRY_DELAY}s..."
+    sleep $RETRY_DELAY
+  done
+  if [ $attempt -eq $MAX_RETRIES ]; then
+    echo "ERROR: Port $port failed to respond after $MAX_RETRIES attempts. Aborting."
+    exit 1
+  fi
+done
+
+echo "All endpoints ready."
 
 # --- Stages 2-4: Verify + classify with Mistral-Nemo (resume picks up from stage 2) ---
 echo "=== Stages 2-4: Verify + Classify (Mistral-Nemo) ==="
