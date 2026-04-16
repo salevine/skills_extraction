@@ -58,6 +58,22 @@ logger = logging.getLogger(__name__)
 # Stage fingerprints — populated by run_pipeline(), read by stage functions
 # when writing checkpoint headers. Maps stage_name -> fingerprint string.
 _stage_fingerprints: Dict[str, str] = {}
+_STAGE_RERUN_ALIASES: Dict[str, str] = {
+    "stage1": "stage1_extracted",
+    "stage1_extracted": "stage1_extracted",
+    "stage2": "stage2_verified",
+    "stage2_verified": "stage2_verified",
+    "stage3": "stage3_requirement",
+    "stage3_requirement": "stage3_requirement",
+    "stage4": "stage4_hardsoft",
+    "stage4_hardsoft": "stage4_hardsoft",
+}
+_STAGE_RERUN_ORDER: List[str] = [
+    "stage1_extracted",
+    "stage2_verified",
+    "stage3_requirement",
+    "stage4_hardsoft",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -647,6 +663,174 @@ def _run_stage1_extract(
 
         write_checkpoint_footer(fh, len(records))
     return records
+
+
+def _normalize_rerun_stage_name(rerun_from_stage: Optional[str]) -> Optional[str]:
+    if not rerun_from_stage:
+        return None
+    key = rerun_from_stage.strip().lower()
+    normalized = _STAGE_RERUN_ALIASES.get(key)
+    if normalized is None:
+        raise ValueError(
+            f"Unsupported rerun stage: {rerun_from_stage}. "
+            "Use one of: stage1, stage2, stage3, stage4."
+        )
+    return normalized
+
+
+def _invalidate_checkpoints_from_stage(
+    output_dir: Path,
+    run_id: str,
+    rerun_from_stage: Optional[str],
+) -> List[Path]:
+    normalized = _normalize_rerun_stage_name(rerun_from_stage)
+    if normalized is None:
+        return []
+
+    invalidated: List[Path] = []
+    start_idx = _STAGE_RERUN_ORDER.index(normalized)
+    for stage_name in _STAGE_RERUN_ORDER[start_idx:]:
+        path = checkpoint_path(output_dir, run_id, stage_name)
+        if path.exists():
+            path.unlink()
+            invalidated.append(path)
+    return invalidated
+
+
+def _extract_stage1_record(
+    job: Dict[str, Any],
+    job_index: int,
+    cfg: PipelineConfig,
+    endpoint: Optional[str] = None,
+    all_endpoints: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    job_key = stable_job_key(job, job_index)
+    raw_mentions = extract_mentions_for_job(
+        cfg,
+        job,
+        job_key,
+        model=cfg.extractor_model,
+        endpoint=endpoint,
+        all_endpoints=all_endpoints,
+    )
+    ser_mentions, lines_reg = serialize_mentions_for_job(raw_mentions)
+    return {
+        "job_index": job_index,
+        "job_key": job_key,
+        "extractor_model_used": cfg.extractor_model,
+        "raw_mentions": ser_mentions,
+        "_parsed_lines": lines_reg,
+    }
+
+
+def _rewrite_stage1_checkpoint(
+    stage1_data: List[Dict[str, Any]],
+    jobs_total: int,
+    ckpt_dir: Path,
+    run_id: str,
+) -> None:
+    path = checkpoint_path(ckpt_dir.parent, run_id, "stage1_extracted")
+    ordered = sorted(stage1_data, key=lambda r: r.get("job_index", 0))
+    with open(path, "w", encoding="utf-8") as fh:
+        write_checkpoint_header(
+            fh,
+            run_id,
+            "stage1_extracted",
+            jobs_total,
+            fingerprint=_stage_fingerprints.get("stage1_extracted"),
+        )
+        for record in ordered:
+            append_checkpoint_record(fh, record)
+        write_checkpoint_footer(fh, len(ordered))
+
+
+def _retry_failed_stage1_records(
+    jobs: List[Dict[str, Any]],
+    stage1_data: List[Dict[str, Any]],
+    cfg: PipelineConfig,
+    run_id: str,
+    ckpt_dir: Path,
+    progress_cb: Optional[Callable] = None,
+) -> Tuple[List[Dict[str, Any]], int]:
+    failed_indices = sorted(
+        record["job_index"]
+        for record in stage1_data
+        if record.get("stage1_error")
+    )
+    if not failed_indices:
+        return stage1_data, 0
+
+    logger.info("Stage 1: retrying %d failed job(s) with current extractor", len(failed_indices))
+    updated_records = {record["job_index"]: dict(record) for record in stage1_data}
+    retried_total = len(failed_indices)
+
+    if cfg.backend == "vllm":
+        endpoints = cfg.vllm_endpoints()
+        num_workers = max(1, len(endpoints))
+        with ThreadPoolExecutor(max_workers=num_workers) as pool:
+            future_to_idx: Dict[Any, int] = {}
+            for job_index in failed_indices:
+                endpoint = endpoints[job_index % num_workers]
+                future = pool.submit(
+                    _extract_stage1_record,
+                    jobs[job_index],
+                    job_index,
+                    cfg,
+                    endpoint,
+                    endpoints,
+                )
+                future_to_idx[future] = job_index
+
+            completed = 0
+            for future in as_completed(future_to_idx):
+                job_index = future_to_idx[future]
+                completed += 1
+                if progress_cb:
+                    progress_cb(
+                        completed - 1,
+                        retried_total,
+                        "stage1_retry",
+                        f"retrying failed job {completed}/{retried_total}",
+                        {"stage": "stage1_retry"},
+                    )
+                try:
+                    updated_records[job_index] = future.result()
+                except Exception as e:
+                    logger.warning("Stage 1 retry failed for %s: %s", stable_job_key(jobs[job_index], job_index), e)
+                    updated_records[job_index] = {
+                        "job_index": job_index,
+                        "job_key": stable_job_key(jobs[job_index], job_index),
+                        "extractor_model_used": cfg.extractor_model,
+                        "raw_mentions": [],
+                        "_parsed_lines": {},
+                        "stage1_error": str(e)[:200],
+                    }
+    else:
+        for completed, job_index in enumerate(failed_indices, start=1):
+            if progress_cb:
+                progress_cb(
+                    completed - 1,
+                    retried_total,
+                    "stage1_retry",
+                    f"retrying failed job {completed}/{retried_total}",
+                    {"stage": "stage1_retry"},
+                )
+            try:
+                updated_records[job_index] = _extract_stage1_record(jobs[job_index], job_index, cfg)
+            except Exception as e:
+                logger.warning("Stage 1 retry failed for %s: %s", stable_job_key(jobs[job_index], job_index), e)
+                updated_records[job_index] = {
+                    "job_index": job_index,
+                    "job_key": stable_job_key(jobs[job_index], job_index),
+                    "extractor_model_used": cfg.extractor_model,
+                    "raw_mentions": [],
+                    "_parsed_lines": {},
+                    "stage1_error": str(e)[:200],
+                }
+
+    refreshed = [updated_records[idx] for idx in sorted(updated_records)]
+    _rewrite_stage1_checkpoint(refreshed, len(jobs), ckpt_dir, run_id)
+    return refreshed, retried_total
 
 
 # ---------------------------------------------------------------------------
@@ -1786,6 +1970,8 @@ def run_pipeline(
     progress_callback: Optional[Callable[[int, int, str, str, Any], None]] = None,
     log_path: Optional[Path] = None,
     resume: bool = True,
+    rerun_from_stage: Optional[str] = None,
+    retry_stage1_errors: bool = False,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Path], RunStats]:
     """
     Process all jobs stage-by-stage and write artifacts under output_dir.
@@ -1799,6 +1985,15 @@ def run_pipeline(
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     set_flush_interval(cfg.checkpoint_flush_interval)
     started = dt.datetime.now(dt.timezone.utc).isoformat()
+
+    invalidated = _invalidate_checkpoints_from_stage(output_dir, run_id, rerun_from_stage)
+    if invalidated:
+        logger.info(
+            "Invalidated %d checkpoint(s) from %s onward for run %s",
+            len(invalidated),
+            _normalize_rerun_stage_name(rerun_from_stage),
+            run_id,
+        )
 
     stats = RunStats(
         run_id=run_id,
@@ -1903,6 +2098,21 @@ def run_pipeline(
         progress_cb=progress_callback,
         fingerprint=fp_s1,
     )
+    if retry_stage1_errors:
+        stage1_data, retried_count = _retry_failed_stage1_records(
+            jobs,
+            stage1_data,
+            cfg,
+            run_id,
+            ckpt_dir,
+            progress_callback,
+        )
+        if retried_count:
+            invalidated.extend(_invalidate_checkpoints_from_stage(output_dir, run_id, "stage2"))
+            logger.info(
+                "Retried %d failed stage-1 job(s); invalidated downstream stage checkpoints",
+                retried_count,
+            )
     stats.record_stage_end("stage1_extracted")
 
     # Count total mentions for stages 2-4

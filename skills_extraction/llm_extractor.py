@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from .boilerplate import label_parsed_lines
@@ -28,6 +29,12 @@ from .schemas import ParsedLine
 from .sectioning import segment_lines, split_inline_section_headers
 
 logger = logging.getLogger(__name__)
+
+_LONG_DESCRIPTION_RETRY_MIN_CHARS = 6000
+_LONG_DESCRIPTION_RETRY_MIN_LINES = 24
+_EXTRACTOR_RETRY_MAX_CHUNK_CHARS = 5000
+_EXTRACTOR_RETRY_MAX_CHUNK_LINES = 24
+_EXTRACTOR_RETRY_MAX_SPLIT_DEPTH = 3
 
 
 def _line_by_id(lines: List[ParsedLine]) -> Dict[str, ParsedLine]:
@@ -168,6 +175,277 @@ def _anchor_span_to_line(
     return pl, pos, pos + len(span)
 
 
+def _call_extractor_v2(
+    cfg: PipelineConfig,
+    model: str,
+    description: str,
+    job_key: str,
+    endpoint: Optional[str] = None,
+    all_endpoints: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    user = EXTRACTOR_V2_USER_TEMPLATE.format(description=description)
+
+    if endpoint and all_endpoints:
+        raw = call_vllm_direct_with_failover(
+            cfg, endpoint, all_endpoints, model, EXTRACTOR_V2_SYSTEM, user, temperature=0.1,
+        )
+    elif endpoint:
+        raw = call_vllm_direct(cfg, endpoint, model, EXTRACTOR_V2_SYSTEM, user, temperature=0.1)
+    else:
+        raw = call_llm(cfg, model, EXTRACTOR_V2_SYSTEM, user, temperature=0.1)
+
+    try:
+        data = parse_json_loose(raw)
+    except Exception as e:
+        raise RuntimeError(f"extractor_json_parse_failed: {job_key}: {e}") from e
+
+    mentions = data.get("mentions") if isinstance(data, dict) else None
+    if mentions is None and isinstance(data, list):
+        mentions = data
+    if not isinstance(mentions, list):
+        raise RuntimeError(f"extractor_invalid_payload: {job_key}: missing mentions list")
+    return mentions
+
+
+def _normalize_v2_mentions(
+    mentions: List[Dict[str, Any]],
+    job_key: str,
+    source_lines: List[ParsedLine],
+    used_positions: Dict[str, List[Tuple[str, int]]],
+) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    for m_idx, m in enumerate(mentions):
+        if not isinstance(m, dict):
+            continue
+        span = m.get("skill_span") or ""
+        if not span.strip():
+            continue
+
+        context = m.get("context") or ""
+        section_hint = m.get("section") or "General"
+        evidence = str(m.get("evidence", span) or "")
+        confidence = m.get("confidence", m.get("span_confidence", 0.7))
+        try:
+            confidence = float(confidence)
+        except (TypeError, ValueError):
+            confidence = 0.7
+
+        anchor = _anchor_span_to_line(
+            span, context, section_hint, source_lines, used_positions,
+        )
+        if anchor is None:
+            logger.debug("Skipping ungroundable span %r in %s", span, job_key)
+            continue
+
+        pl, line_cs, line_ce = anchor
+        glob_cs = pl.char_start + line_cs
+        glob_ce = pl.char_start + line_ce
+
+        requirement = str(m.get("requirement", "unclear")).lower()
+        if requirement not in ("required", "optional", "unclear"):
+            requirement = "unclear"
+        hard_soft = str(m.get("hard_soft", "unknown")).lower()
+        if hard_soft not in ("hard", "soft", "unknown"):
+            hard_soft = "unknown"
+
+        m["span_confidence"] = confidence
+        m["evidence"] = evidence
+        m["normalized_candidate"] = m.get("normalized_skill", span)
+        m["is_skill"] = True
+        m["requirement_level"] = requirement
+        m["hard_soft"] = hard_soft
+        m["_glob_char_start"] = glob_cs
+        m["_glob_char_end"] = glob_ce
+        m["_line_char_start"] = line_cs
+        m["_line_char_end"] = line_ce
+        m["_offset_valid"] = pl.text[line_cs:line_ce] == span
+        m["_parsed_line"] = pl
+        normalized.append(m)
+
+    return normalized
+
+
+def _chunk_text_from_lines(normalized_text: str, chunk_lines: List[ParsedLine]) -> str:
+    if not chunk_lines:
+        return ""
+    start = chunk_lines[0].char_start
+    end = chunk_lines[-1].char_end
+    return normalized_text[start:end]
+
+
+def _chunk_lines_for_retry(lines: List[ParsedLine]) -> List[List[ParsedLine]]:
+    chunks: List[List[ParsedLine]] = []
+    current: List[ParsedLine] = []
+    current_chars = 0
+
+    for pl in lines:
+        line_chars = max(1, pl.char_end - pl.char_start)
+        next_chars = current_chars + line_chars + (1 if current else 0)
+        start_new = bool(current) and (
+            next_chars > _EXTRACTOR_RETRY_MAX_CHUNK_CHARS
+            or len(current) >= _EXTRACTOR_RETRY_MAX_CHUNK_LINES
+            or (
+                pl.section.lower() != current[-1].section.lower()
+                and current_chars >= (_EXTRACTOR_RETRY_MAX_CHUNK_CHARS // 2)
+            )
+        )
+        if start_new:
+            chunks.append(current)
+            current = []
+            current_chars = 0
+        current.append(pl)
+        current_chars += line_chars + (1 if current_chars else 0)
+
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _is_retryable_extractor_error(err: Exception) -> bool:
+    msg = str(err)
+    return msg.startswith("extractor_json_parse_failed") or msg.startswith("extractor_invalid_payload")
+
+
+def _split_text_for_retry(text: str) -> Optional[Tuple[str, str]]:
+    if len(text) < 2:
+        return None
+
+    midpoint = len(text) // 2
+    boundary_match = None
+    boundary_distance = None
+    for m in re.finditer(r"[.!?;\n]+\s+", text):
+        pos = m.end()
+        dist = abs(pos - midpoint)
+        if boundary_distance is None or dist < boundary_distance:
+            boundary_match = pos
+            boundary_distance = dist
+
+    split_at = boundary_match
+    if split_at is None:
+        window = 400
+        lo = max(1, midpoint - window)
+        hi = min(len(text) - 1, midpoint + window)
+        left = text.rfind(" ", lo, midpoint)
+        right = text.find(" ", midpoint, hi)
+        candidates = [p for p in (left, right) if p not in (-1, 0)]
+        if candidates:
+            split_at = min(candidates, key=lambda p: abs(p - midpoint))
+
+    if split_at is None:
+        split_at = midpoint
+
+    left_text = text[:split_at].strip()
+    right_text = text[split_at:].strip()
+    if not left_text or not right_text:
+        return None
+    return left_text, right_text
+
+
+def _extract_mentions_recursive(
+    cfg: PipelineConfig,
+    model: str,
+    description: str,
+    job_key: str,
+    source_lines: List[ParsedLine],
+    used_positions: Dict[str, List[Tuple[str, int]]],
+    endpoint: Optional[str] = None,
+    all_endpoints: Optional[List[str]] = None,
+    depth: int = 0,
+) -> List[Dict[str, Any]]:
+    try:
+        mentions = _call_extractor_v2(
+            cfg, model, description, job_key, endpoint=endpoint, all_endpoints=all_endpoints,
+        )
+    except RuntimeError as e:
+        if (
+            not _is_retryable_extractor_error(e)
+            or depth >= _EXTRACTOR_RETRY_MAX_SPLIT_DEPTH
+            or len(description) < (_EXTRACTOR_RETRY_MAX_CHUNK_CHARS // 2)
+        ):
+            raise
+        split = _split_text_for_retry(description)
+        if split is None:
+            raise
+        logger.debug(
+            "Retrying extractor chunk for %s at depth %d after %s",
+            job_key,
+            depth + 1,
+            e,
+        )
+        recovered: List[Dict[str, Any]] = []
+        for chunk_text in split:
+            recovered.extend(
+                _extract_mentions_recursive(
+                    cfg,
+                    model,
+                    chunk_text,
+                    job_key,
+                    source_lines,
+                    used_positions,
+                    endpoint=endpoint,
+                    all_endpoints=all_endpoints,
+                    depth=depth + 1,
+                )
+            )
+        return recovered
+    return _normalize_v2_mentions(mentions, job_key, source_lines, used_positions)
+
+
+def _extract_mentions_chunked(
+    cfg: PipelineConfig,
+    model: str,
+    normalized_text: str,
+    job_key: str,
+    source_lines: List[ParsedLine],
+    used_positions: Dict[str, List[Tuple[str, int]]],
+    endpoint: Optional[str] = None,
+    all_endpoints: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    recovered: List[Dict[str, Any]] = []
+    failures: List[str] = []
+    chunks = _chunk_lines_for_retry(source_lines)
+
+    for chunk_idx, chunk_lines in enumerate(chunks):
+        chunk_text = _chunk_text_from_lines(normalized_text, chunk_lines)
+        if not chunk_text.strip():
+            continue
+        try:
+            recovered.extend(
+                _extract_mentions_recursive(
+                    cfg,
+                    model,
+                    chunk_text,
+                    job_key,
+                    source_lines,
+                    used_positions,
+                    endpoint=endpoint,
+                    all_endpoints=all_endpoints,
+                    depth=0,
+                )
+            )
+        except RuntimeError as e:
+            failures.append(str(e))
+            logger.warning(
+                "Chunked extractor retry failed for %s chunk %d/%d: %s",
+                job_key,
+                chunk_idx + 1,
+                len(chunks),
+                e,
+            )
+
+    if recovered:
+        if failures:
+            logger.warning(
+                "Recovered partial extractor output for %s after chunk retries (%d failed chunk(s))",
+                job_key,
+                len(failures),
+            )
+        return recovered
+    if failures:
+        raise RuntimeError(failures[0])
+    return []
+
+
 def extract_mentions_for_job(
     cfg: PipelineConfig,
     job: Dict[str, Any],
@@ -195,85 +473,42 @@ def extract_mentions_for_job(
     if not desc_raw or not desc_raw.strip():
         return []
 
-    user = EXTRACTOR_V2_USER_TEMPLATE.format(description=desc_raw)
-
-    if endpoint and all_endpoints:
-        raw = call_vllm_direct_with_failover(
-            cfg, endpoint, all_endpoints, model, EXTRACTOR_V2_SYSTEM, user, temperature=0.1,
-        )
-    elif endpoint:
-        raw = call_vllm_direct(cfg, endpoint, model, EXTRACTOR_V2_SYSTEM, user, temperature=0.1)
-    else:
-        raw = call_llm(cfg, model, EXTRACTOR_V2_SYSTEM, user, temperature=0.1)
-
-    try:
-        data = parse_json_loose(raw)
-    except Exception as e:
-        raise RuntimeError(f"extractor_json_parse_failed: {job_key}: {e}") from e
-
-    mentions = data.get("mentions") if isinstance(data, dict) else None
-    if mentions is None and isinstance(data, list):
-        mentions = data
-    if not isinstance(mentions, list):
-        raise RuntimeError(f"extractor_invalid_payload: {job_key}: missing mentions list")
-
-    # Build real parsed lines from the source text
-    source_lines = _build_source_lines(job_key, desc_raw)
-    # Track used positions per span to handle repeated spans deterministically
+    pre = preprocess_description(desc_raw)
+    normalized_text = split_inline_section_headers(pre.description_normalized)
+    source_lines = segment_lines(job_key, normalized_text)
+    label_parsed_lines(source_lines)
     used_positions: Dict[str, List[Tuple[str, int]]] = {}
 
-    normalized: List[Dict[str, Any]] = []
-    for m_idx, m in enumerate(mentions):
-        if not isinstance(m, dict):
-            continue
-        span = m.get("skill_span") or ""
-        if not span.strip():
-            continue
-
-        context = m.get("context") or ""
-        section_hint = m.get("section") or "General"
-        evidence = str(m.get("evidence", span) or "")
-        confidence = m.get("confidence", m.get("span_confidence", 0.7))
-        try:
-            confidence = float(confidence)
-        except (TypeError, ValueError):
-            confidence = 0.7
-
-        # Anchor to a real source line — skip if ungroundable
-        anchor = _anchor_span_to_line(
-            span, context, section_hint, source_lines, used_positions,
+    try:
+        mentions = _call_extractor_v2(
+            cfg, model, desc_raw, job_key, endpoint=endpoint, all_endpoints=all_endpoints,
         )
-        if anchor is None:
-            logger.debug("Skipping ungroundable span %r in %s", span, job_key)
-            continue
-
-        pl, line_cs, line_ce = anchor
-        glob_cs = pl.char_start + line_cs
-        glob_ce = pl.char_start + line_ce
-
-        # Classification fields from combined prompt
-        requirement = str(m.get("requirement", "unclear")).lower()
-        if requirement not in ("required", "optional", "unclear"):
-            requirement = "unclear"
-        hard_soft = str(m.get("hard_soft", "unknown")).lower()
-        if hard_soft not in ("hard", "soft", "unknown"):
-            hard_soft = "unknown"
-
-        m["span_confidence"] = confidence
-        m["evidence"] = evidence
-        m["normalized_candidate"] = m.get("normalized_skill", span)
-        m["is_skill"] = True  # if it's in the output, the model considers it a skill
-        m["requirement_level"] = requirement
-        m["hard_soft"] = hard_soft
-        m["_glob_char_start"] = glob_cs
-        m["_glob_char_end"] = glob_ce
-        m["_line_char_start"] = line_cs
-        m["_line_char_end"] = line_ce
-        m["_offset_valid"] = pl.text[line_cs:line_ce] == span
-        m["_parsed_line"] = pl
-        normalized.append(m)
-
-    return normalized
+        return _normalize_v2_mentions(mentions, job_key, source_lines, used_positions)
+    except RuntimeError as e:
+        should_retry_chunked = (
+            _is_retryable_extractor_error(e)
+            and (
+                len(desc_raw) >= _LONG_DESCRIPTION_RETRY_MIN_CHARS
+                or len(source_lines) >= _LONG_DESCRIPTION_RETRY_MIN_LINES
+            )
+        )
+        if not should_retry_chunked:
+            raise
+        logger.warning(
+            "Extractor failed for long description %s; retrying with smaller chunks: %s",
+            job_key,
+            e,
+        )
+        return _extract_mentions_chunked(
+            cfg,
+            model,
+            normalized_text,
+            job_key,
+            source_lines,
+            used_positions,
+            endpoint=endpoint,
+            all_endpoints=all_endpoints,
+        )
 
 
 # ---------------------------------------------------------------------------

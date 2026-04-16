@@ -978,6 +978,215 @@ def test_fingerprint_changes_with_model():
 
 
 # ---------------------------------------------------------------------------
+# Test 21: Long descriptions retry with smaller chunks after parse failure
+# ---------------------------------------------------------------------------
+
+def test_long_description_chunk_retry():
+    """Long extractor payload failures should retry on smaller chunks and
+    recover mentions instead of failing the whole job."""
+    from skills_extraction import llm_extractor
+    from skills_extraction.config import PipelineConfig
+
+    original_call_llm = llm_extractor.call_llm
+    call_counts = {"full": 0, "chunk": 0}
+
+    def _fake_call_llm(cfg, model, system, user, temperature=0.1, role="extractor"):
+        if len(user) > 7000:
+            call_counts["full"] += 1
+            return '{"mentions": ['
+        if "Python is required for this role." in user:
+            call_counts["chunk"] += 1
+            return """{"mentions":[{"skill_span":"Python","context":"Python is required for this role.","section":"Requirements","normalized_skill":"Python","evidence":"Python","confidence":0.91,"requirement":"required","hard_soft":"hard"}]}"""
+        return """{"mentions":[]}"""
+
+    llm_extractor.call_llm = _fake_call_llm
+    try:
+        filler = "\n".join(
+            f"Line {i}: filler text to make the description long enough for chunk retry."
+            for i in range(180)
+        )
+        desc = f"Requirements\n{filler}\nPython is required for this role.\n"
+        cfg = PipelineConfig(backend="ollama")
+        mentions = llm_extractor.extract_mentions_for_job(
+            cfg,
+            {"Description": desc},
+            "JLONG",
+            model="test-extractor",
+        )
+        assert call_counts["full"] == 1, f"FAIL: expected one failed full-doc attempt, got {call_counts['full']}"
+        assert call_counts["chunk"] >= 1, "FAIL: expected chunk retry call containing Python"
+        assert any(m["skill_span"] == "Python" for m in mentions), (
+            f"FAIL: expected recovered Python mention, got {mentions}"
+        )
+        print("PASS: test_long_description_chunk_retry")
+    finally:
+        llm_extractor.call_llm = original_call_llm
+
+
+# ---------------------------------------------------------------------------
+# Test 22: Explicit checkpoint invalidation from a stage onward
+# ---------------------------------------------------------------------------
+
+def test_invalidate_checkpoints_from_stage():
+    """Invalidating from stage2 should preserve stage1 and remove stages 2-4."""
+    import tempfile, shutil
+    from pathlib import Path
+    from skills_extraction.pipeline import _invalidate_checkpoints_from_stage
+    from skills_extraction.checkpoint import checkpoint_path
+
+    tmpdir = Path(tempfile.mkdtemp())
+    try:
+        ckpt_dir = tmpdir / "checkpoints"
+        ckpt_dir.mkdir()
+        stage_paths = {
+            name: checkpoint_path(tmpdir, "rerun_test", name)
+            for name in ("stage1_extracted", "stage2_verified", "stage3_requirement", "stage4_hardsoft")
+        }
+        for path in stage_paths.values():
+            path.write_text("placeholder\n", encoding="utf-8")
+
+        invalidated = _invalidate_checkpoints_from_stage(tmpdir, "rerun_test", "stage2")
+        assert stage_paths["stage1_extracted"].exists(), "FAIL: stage1 checkpoint should remain"
+        assert not stage_paths["stage2_verified"].exists(), "FAIL: stage2 checkpoint should be removed"
+        assert not stage_paths["stage3_requirement"].exists(), "FAIL: stage3 checkpoint should be removed"
+        assert not stage_paths["stage4_hardsoft"].exists(), "FAIL: stage4 checkpoint should be removed"
+        assert len(invalidated) == 3, f"FAIL: expected 3 invalidated checkpoints, got {len(invalidated)}"
+        print("PASS: test_invalidate_checkpoints_from_stage")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+# ---------------------------------------------------------------------------
+# Test 23: Retry only failed stage-1 records and rewrite checkpoint
+# ---------------------------------------------------------------------------
+
+def test_retry_failed_stage1_records_repairs_checkpoint():
+    """Retrying stage1 errors should only rerun failed records and rewrite the
+    stage1 checkpoint with the repaired result."""
+    import tempfile, shutil
+    from pathlib import Path
+
+    from skills_extraction import pipeline
+    from skills_extraction.checkpoint import checkpoint_path, load_checkpoint, serialize_mentions_for_job
+    from skills_extraction.config import PipelineConfig
+    from skills_extraction.schemas import ParsedLine
+
+    tmpdir = Path(tempfile.mkdtemp())
+    original_extract = pipeline.extract_mentions_for_job
+    original_fp = pipeline._stage_fingerprints.get("stage1_extracted")
+    try:
+        ckpt_dir = tmpdir / "checkpoints"
+        ckpt_dir.mkdir()
+        pipeline._stage_fingerprints["stage1_extracted"] = "TEST_STAGE1_FP"
+
+        repaired_line = ParsedLine(
+            line_id="J1_L0001",
+            section="requirements",
+            text="Python required.",
+            char_start=0,
+            char_end=16,
+            boilerplate_label="skills_relevant",
+            line_index=0,
+        )
+        repaired_mention = {
+            "skill_span": "Python",
+            "normalized_candidate": "Python",
+            "span_confidence": 0.9,
+            "evidence": "Python",
+            "is_skill": True,
+            "requirement_level": "required",
+            "hard_soft": "hard",
+            "_glob_char_start": 0,
+            "_glob_char_end": 6,
+            "_line_char_start": 0,
+            "_line_char_end": 6,
+            "_offset_valid": True,
+            "_parsed_line": repaired_line,
+        }
+        good_line = ParsedLine(
+            line_id="J2_L0001",
+            section="requirements",
+            text="SQL required.",
+            char_start=0,
+            char_end=13,
+            boilerplate_label="skills_relevant",
+            line_index=0,
+        )
+        good_mention = {
+            "skill_span": "SQL",
+            "normalized_candidate": "SQL",
+            "span_confidence": 0.88,
+            "evidence": "SQL",
+            "is_skill": True,
+            "requirement_level": "required",
+            "hard_soft": "hard",
+            "_glob_char_start": 0,
+            "_glob_char_end": 3,
+            "_line_char_start": 0,
+            "_line_char_end": 3,
+            "_offset_valid": True,
+            "_parsed_line": good_line,
+        }
+        good_ser, good_reg = serialize_mentions_for_job([good_mention])
+
+        jobs = [
+            {"id": 1, "Description": "Python required."},
+            {"id": 2, "Description": "SQL required."},
+        ]
+        stage1_data = [
+            {
+                "job_index": 0,
+                "job_key": "J1",
+                "extractor_model_used": "broken-model",
+                "raw_mentions": [],
+                "_parsed_lines": {},
+                "stage1_error": "extractor_json_parse_failed: J1: bad payload",
+            },
+            {
+                "job_index": 1,
+                "job_key": "J2",
+                "extractor_model_used": "good-model",
+                "raw_mentions": good_ser,
+                "_parsed_lines": good_reg,
+            },
+        ]
+
+        def _fake_extract(cfg, job, job_key, model=None, endpoint=None, all_endpoints=None):
+            if job_key == "J1":
+                return [dict(repaired_mention)]
+            raise AssertionError(f"FAIL: should only retry failed record, got {job_key}")
+
+        pipeline.extract_mentions_for_job = _fake_extract
+        repaired, retried = pipeline._retry_failed_stage1_records(
+            jobs,
+            stage1_data,
+            PipelineConfig(backend="ollama"),
+            "rerun_stage1",
+            ckpt_dir,
+        )
+
+        assert retried == 1, f"FAIL: expected 1 retried record, got {retried}"
+        repaired_record = repaired[0]
+        assert "stage1_error" not in repaired_record, f"FAIL: repaired record still has stage1_error: {repaired_record}"
+        assert len(repaired_record["raw_mentions"]) == 1, "FAIL: repaired record should have one mention"
+
+        path = checkpoint_path(tmpdir, "rerun_stage1", "stage1_extracted")
+        meta, records = load_checkpoint(path)
+        assert meta.get("fingerprint") == "TEST_STAGE1_FP", "FAIL: rewritten checkpoint missing fingerprint"
+        assert len(records) == 2, f"FAIL: expected 2 records in checkpoint, got {len(records)}"
+        assert records[0].get("job_key") == "J1", "FAIL: repaired checkpoint record missing job order"
+        assert "stage1_error" not in records[0], "FAIL: rewritten repaired checkpoint should not keep old error"
+        print("PASS: test_retry_failed_stage1_records_repairs_checkpoint")
+    finally:
+        pipeline.extract_mentions_for_job = original_extract
+        if original_fp is None:
+            pipeline._stage_fingerprints.pop("stage1_extracted", None)
+        else:
+            pipeline._stage_fingerprints["stage1_extracted"] = original_fp
+        shutil.rmtree(tmpdir)
+
+
+# ---------------------------------------------------------------------------
 # Run all
 # ---------------------------------------------------------------------------
 
@@ -1003,6 +1212,9 @@ if __name__ == "__main__":
         ("test_missing_fingerprint_invalidates", test_missing_fingerprint_invalidates),
         ("test_checkpoint_total_mismatch_invalidates", test_checkpoint_total_mismatch_invalidates),
         ("test_fingerprint_changes_with_model", test_fingerprint_changes_with_model),
+        ("test_long_description_chunk_retry", test_long_description_chunk_retry),
+        ("test_invalidate_checkpoints_from_stage", test_invalidate_checkpoints_from_stage),
+        ("test_retry_failed_stage1_records_repairs_checkpoint", test_retry_failed_stage1_records_repairs_checkpoint),
     ]
 
     failures = 0

@@ -165,7 +165,11 @@ Rules:
 - Base your decision only on the provided line text and section label.
 - Do not infer from outside knowledge unless needed only to recognize a commonly known technology or skill term.
 - evidence must be an exact substring of line_text.
-- Be strict: if the candidate is vague, generic, or unsupported, reject it.
+- Do not reject a candidate only because it is common, broad, or interpersonal.
+- Accept interpersonal or behavioral competencies when the line clearly presents them as a capability, qualification, or requirement.
+- Examples of valid soft skills include communication skills, leadership, collaboration, problem-solving, stakeholder management, and project management.
+- Reject generic workplace phrases, team or org references, and responsibility fragments that do not name a competency.
+- Examples of invalid generic phrases include cross-functional teams, team player, works well with others, and fast-paced environment.
 - notes must be short, direct, and 12 words or fewer.
 - Do not include keys other than the required keys.
 """
@@ -182,7 +186,9 @@ Return JSON with exactly these keys:
 
 Decision guidance:
 - Accept concrete tools, technologies, methods, technical concepts, domain skills, and interpersonal competencies.
-- Reject titles, education-only requirements, generic business phrases, and non-skill administrative text.
+- Accept soft skills when the candidate names a concrete capability the person should possess.
+- Do not reject a soft skill only because it is common or broad.
+- Reject titles, education-only requirements, team or org references, generic business phrases, and non-skill administrative text.
 """
 
 

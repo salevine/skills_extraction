@@ -106,6 +106,17 @@ Examples (run from repository root — the folder that contains `skills_extracti
     parser.add_argument("--no-reports", action="store_true", help="Skip derived CSV summary reports")
     parser.add_argument("--no-resume", action="store_true", help="Ignore existing checkpoints; overwrite from scratch")
     parser.add_argument("--resume-latest", action="store_true", help="Resume the most recent run from checkpoints")
+    parser.add_argument(
+        "--rerun-from",
+        choices=["stage1", "stage2", "stage3", "stage4"],
+        default="",
+        help="Delete checkpoints from this stage onward before resuming (for example: stage2 to reuse stage1 and rerun stages 2-4)",
+    )
+    parser.add_argument(
+        "--retry-stage1-errors",
+        action="store_true",
+        help="When reusing an existing stage1 checkpoint, retry only records that still have stage1_error before downstream stages run",
+    )
     parser.add_argument("--backend", choices=["ollama", "openrouter", "vllm"], default="", help="LLM backend (default: ollama, or SKILLS_BACKEND env)")
     parser.add_argument("--batch-lines", type=int, default=5, help="Max lines per extractor LLM call")
     parser.add_argument("--context-size", type=int, default=32768, help="Ollama num_ctx")
@@ -193,6 +204,10 @@ Examples (run from repository root — the folder that contains `skills_extracti
     )
     print(f"Checkpoints: {(out_dir / 'checkpoints').resolve()}")
     print(f"Resume: {not args.no_resume}")
+    if args.rerun_from:
+        print(f"Rerun from: {args.rerun_from}")
+    if args.retry_stage1_errors:
+        print("Retry stage1 errors: True")
     print(f"Log: {log_file}")
     print("=" * 70)
     print()
@@ -258,6 +273,8 @@ Examples (run from repository root — the folder that contains `skills_extracti
         progress_callback=_on_progress,
         log_path=log_file,
         resume=not args.no_resume,
+        rerun_from_stage=args.rerun_from or None,
+        retry_stage1_errors=args.retry_stage1_errors,
     )
     _configure_logging(log_file, quiet_console=False)
 

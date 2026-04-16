@@ -164,6 +164,9 @@ python -m skills_extraction [OPTIONS]
 | `--skip-llm` | Legacy/debug flag. The richest no-LLM structural output is still on the older `process_single_job()` path; the default stage-first pipeline is centered on stage-1 extraction. |
 | `--no-reports` | Skip derived quality/frequency/low-confidence reports. |
 | `--no-resume` | Ignore existing checkpoints; overwrite from scratch. |
+| `--resume-latest` | Reuse the most recent checkpointed run id in the output directory. |
+| `--rerun-from {stage1,stage2,stage3,stage4}` | Delete checkpoints from that stage onward before resuming. Use `stage2` to keep stage1 and rerun stages 2-4. |
+| `--retry-stage1-errors` | Re-extract only the stage1 records that still have `stage1_error`, then continue with downstream stages. |
 | `--batch-lines` | Max lines per extractor request (default `5`). |
 | `--timeout` | HTTP timeout in seconds (default `300`). |
 
@@ -335,6 +338,8 @@ conda run -n skills pip install -r requirements.txt
 - **Model names:** vLLM registers models by HuggingFace ID (`Qwen/Qwen3-14B`), not Ollama tags (`qwen3:14b`). Use `curl localhost:PORT/v1/models` to check.
 - **`--vllm` vs `--backend vllm`:** Use `--vllm` to enable vLLM — this flag triggers the port/host/endpoint overrides. `--backend vllm` alone sets the backend but ignores `--vllm-*` arguments.
 - **Checkpoints are per-run-id:** Multiple runs can share an output directory without collision.
+- **Rerunning only later stages:** Reuse the same `--run-id` and pass `--rerun-from stage2` to keep the existing stage1 checkpoint and rerun verification/classification.
+- **Repairing old stage1 parse failures:** Add `--retry-stage1-errors` to retry only the failed stage1 records before stages 2-4 run.
 
 ### Performance observations (8x RTX A6000, Qwen3-14B)
 
