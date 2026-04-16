@@ -19,6 +19,8 @@ Write-Host "  pipeline.py: $lineCount lines"
 # Copy top-level scripts
 Write-Host "Deploying scripts..."
 $scripts = @(
+    "archive_old_runs.py",
+    "clone_stage1_checkpoint.py",
     "startQwen",
     "startQwen.sh",
     "startMistral",

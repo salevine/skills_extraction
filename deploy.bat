@@ -12,11 +12,16 @@ ssh %SERVER% "mkdir -p %REMOTE% ~/jobs"
 rsync -avz ^
   --exclude ".venv" ^
   --exclude "__pycache__" ^
+  --exclude "*.pyc" ^
   --exclude ".git" ^
+  --exclude ".pytest_cache" ^
+  --exclude ".mypy_cache" ^
+  --exclude ".ruff_cache" ^
+  --exclude ".DS_Store" ^
   --exclude "skills_extraction_output" ^
   --exclude "_skills_test_out" ^
   --exclude "*.log" ^
-  --exclude "out" ^
+  --exclude "out/" ^
   --exclude "nul" ^
   --exclude "full_run_output" ^
   %LOCAL%/ %SERVER%:%REMOTE%/
