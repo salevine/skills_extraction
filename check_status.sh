@@ -77,12 +77,30 @@ count_errors() {
     grep -c '"status": "error"' "$f" 2>/dev/null || echo "0"
 }
 
-# Get expected record count from previous completed stage
+# Get expected record count for a stage.
+# For stages 2-4, the checkpoint header already stores total mention count.
 get_expected() {
     local rid="$1"
-    local stage_idx="$2"
+    local stage="$2"
+    local stage_idx="$3"
+    local stage_file="$CHECKPOINT_DIR/${rid}_${stage}.jsonl"
+
+    if [ -f "$stage_file" ]; then
+        local header_total
+        header_total=$(python3 -c "
+import json, sys
+with open('$stage_file') as f:
+    header = json.loads(f.readline())
+print(header.get('total_jobs', '?'))
+" 2>/dev/null || echo "?")
+        if [ "$header_total" != "?" ]; then
+            echo "$header_total"
+            return
+        fi
+    fi
+
     if [ "$stage_idx" -le 1 ]; then
-        # Stages 0-1 are per-job; get total_jobs from header
+        # Fallback for stages 0-1: read total_jobs from any checkpoint header.
         local any_file
         any_file=$(ls "$CHECKPOINT_DIR"/${rid}_stage*.jsonl 2>/dev/null | head -1)
         if [ -n "$any_file" ]; then
@@ -96,22 +114,7 @@ print(header.get('total_jobs', '?'))
             echo "?"
         fi
     else
-        # Stages 2-4 use mention count from stage 1
-        local s1="$CHECKPOINT_DIR/${rid}_stage1_extracted.jsonl"
-        if [ -f "$s1" ]; then
-            local last
-            last=$(tail -1 "$s1")
-            echo "$last" | python3 -c "
-import json, sys
-obj = json.load(sys.stdin)
-if obj.get('_complete'):
-    print(obj.get('record_count', '?'))
-else:
-    print('?')
-" 2>/dev/null || echo "?"
-        else
-            echo "?"
-        fi
+        echo "?"
     fi
 }
 
@@ -197,10 +200,10 @@ for rid in $run_ids; do
         else
             data_lines=$((lines - 1))  # subtract header
             started=$(head -1 "$f" | python3 -c "import sys,json; print(json.load(sys.stdin).get('started_at','?')[:19])" 2>/dev/null || echo "?")
-            expected=$(get_expected "$rid" "$i")
+            expected=$(get_expected "$rid" "$stage" "$i")
             pct=""
             if [ "$expected" != "?" ] && [ "$expected" -gt 0 ] 2>/dev/null; then
-                pct=" ($(( data_lines * 100 / expected ))%)"
+                pct=$(python3 -c "done=$data_lines; total=$expected; print(f' ({done * 100 / total:.1f}%)')")
             fi
             err_str=""
             if [ "$errors" -gt 0 ] 2>/dev/null; then err_str="  errors=$errors"; fi
