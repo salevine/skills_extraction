@@ -43,6 +43,7 @@ from .exporters import (
     write_quality_report,
 )
 from .io_utils import augment_job_record, stable_job_key
+from .ontology import build_ontology, write_ontology_json, write_ontology_csv
 from .llm_extractor import batch_lines, extract_mentions_for_batch, extract_mentions_for_job
 from .llm_hardsoft_classifier import classify_hard_soft
 from .llm_requirement_classifier import classify_requirement_level
@@ -2169,6 +2170,11 @@ def run_pipeline(
 
     cfg.llm_timing_callback = original_timing
 
+    # --- Stage 6: Build ontology (no LLM) ---
+    stats.record_stage_start("stage6_ontology")
+    ontology = build_ontology(augmented, run_id)
+    stats.record_stage_end("stage6_ontology")
+
     # A job is "successful" if it assembled without a pipeline execution error.
     # Zero mentions is valid. Stage-level extraction failures propagate into
     # extraction_metadata.error so they are not counted as successes.
@@ -2201,6 +2207,11 @@ def run_pipeline(
 
     paths["job_skills_csv"] = output_dir / f"SkillsExtraction_job_skills_run_{run_id}.csv"
     write_job_skills_summary(paths["job_skills_csv"], augmented)
+
+    paths["ontology_json"] = output_dir / f"SkillsExtraction_ontology_run_{run_id}.json"
+    paths["ontology_csv"] = output_dir / f"SkillsExtraction_ontology_run_{run_id}.csv"
+    write_ontology_json(paths["ontology_json"], ontology)
+    write_ontology_csv(paths["ontology_csv"], ontology)
 
     if log_path:
         try:

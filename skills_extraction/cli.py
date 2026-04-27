@@ -18,6 +18,7 @@ from pathlib import Path
 
 from .config import PipelineConfig, load_config_from_env, resolve_ollama_base_url
 from .io_utils import load_jobs_json
+from .ontology import build_ontology_from_file
 from .pipeline import run_pipeline
 
 logger = logging.getLogger(__name__)
@@ -122,12 +123,28 @@ Examples (run from repository root — the folder that contains `skills_extracti
     parser.add_argument("--context-size", type=int, default=32768, help="Ollama num_ctx")
     parser.add_argument("--timeout", type=int, default=300, help="Ollama HTTP timeout in seconds (default: 300)")
 
+    # Ontology-only mode
+    parser.add_argument(
+        "--ontology-only",
+        default="",
+        metavar="AUGMENTED_JSON",
+        help="Skip pipeline; build ontology from an existing augmented JSON file",
+    )
+
     # vLLM backend options
     parser.add_argument("--vllm", action="store_true", help="Use vLLM backend instead of Ollama")
     parser.add_argument("--vllm-host", default="localhost", help="vLLM server hostname (default: localhost)")
     parser.add_argument("--vllm-base-port", type=int, default=8001, help="vLLM first endpoint port (default: 8001)")
     parser.add_argument("--vllm-num-endpoints", type=int, default=8, help="Number of vLLM endpoints (default: 8)")
     args = parser.parse_args()
+
+    if args.ontology_only:
+        build_ontology_from_file(
+            Path(args.ontology_only),
+            output_dir=Path(args.output_dir),
+            run_id=args.run_id.strip() or None,
+        )
+        return
 
     label = args.run_id.strip()
     if args.resume_latest:
@@ -295,6 +312,8 @@ Examples (run from repository root — the folder that contains `skills_extracti
         "frequency_csv": "Skill frequency",
         "low_conf_json": "Low-confidence queue",
         "run_summary_json": "Run summary (for papers)",
+        "ontology_json": "Skills ontology (JSON)",
+        "ontology_csv": "Skills ontology (CSV)",
     }
     for k, p in paths.items():
         label = name_map.get(k, k)
