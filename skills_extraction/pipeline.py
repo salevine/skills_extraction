@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import queue
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -545,26 +546,39 @@ def _run_stage1_extract(
             failed_count = [0]
             total_jobs = len(jobs) - start_idx
             num_workers = len(endpoints)
-            backlog_limit = num_workers * 2
+            backlog_limit = min(total_jobs, 500)
 
             pending_results: Dict[int, Dict[str, Any]] = {}
             next_write_idx = start_idx
             next_submit_idx = start_idx
 
-            with ThreadPoolExecutor(max_workers=num_workers) as pool:
+            ep_queue: queue.Queue = queue.Queue()
+            for _ep in endpoints:
+                ep_queue.put(_ep)
+
+            def _extract_with_free_endpoint(job_idx: int) -> list:
+                """Acquire a free endpoint, run extraction, return endpoint."""
+                _job = jobs[job_idx]
+                _job_key = stable_job_key(_job, job_idx)
+                ep = ep_queue.get()
+                try:
+                    return extract_mentions_for_job(
+                        cfg, _job, _job_key, cfg.extractor_model, ep,
+                        all_endpoints=endpoints,
+                    )
+                finally:
+                    ep_queue.put(ep)
+
+            with ThreadPoolExecutor(max_workers=num_workers + 2) as pool:
                 future_to_idx: Dict[Any, int] = {}
 
                 def _submit_available() -> None:
                     nonlocal next_submit_idx
                     while (next_submit_idx < len(jobs)
                            and (next_submit_idx - next_write_idx) < backlog_limit):
-                        _job = jobs[next_submit_idx]
-                        _job_key = stable_job_key(_job, next_submit_idx)
-                        ep = endpoints[next_submit_idx % num_workers]
                         f = pool.submit(
-                            extract_mentions_for_job,
-                            cfg, _job, _job_key, cfg.extractor_model, ep,
-                            all_endpoints=endpoints,
+                            _extract_with_free_endpoint,
+                            next_submit_idx,
                         )
                         future_to_idx[f] = next_submit_idx
                         next_submit_idx += 1
