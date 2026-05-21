@@ -18,6 +18,7 @@ from pathlib import Path
 
 from .config import PipelineConfig, load_config_from_env, resolve_ollama_base_url
 from .io_utils import load_jobs_json
+from .job_title_skills import build_job_title_skills_from_file, DEFAULT_CONFIDENCE_FLOOR
 from .ontology import build_ontology_from_file
 from .pipeline import run_pipeline
 
@@ -131,6 +132,26 @@ Examples (run from repository root — the folder that contains `skills_extracti
         help="Skip pipeline; build ontology from an existing augmented JSON file",
     )
 
+    # Job-title skills standalone mode
+    parser.add_argument(
+        "--job-title-skills-only",
+        default="",
+        metavar="AUGMENTED_JSON",
+        help="Skip pipeline; build job-title skill weights from an existing augmented JSON file",
+    )
+    parser.add_argument(
+        "--confidence-floor",
+        type=float,
+        default=DEFAULT_CONFIDENCE_FLOOR,
+        help=f"Minimum final_confidence for inclusion (default: {DEFAULT_CONFIDENCE_FLOOR})",
+    )
+    parser.add_argument(
+        "--title-norm",
+        default="",
+        metavar="EXCEL_PATH",
+        help="Excel file with title normalization (Raw_title -> Normalized_title mapping from Job_Norm.py)",
+    )
+
     # vLLM backend options
     parser.add_argument("--vllm", action="store_true", help="Use vLLM backend instead of Ollama")
     parser.add_argument("--vllm-host", default="localhost", help="vLLM server hostname (default: localhost)")
@@ -143,6 +164,16 @@ Examples (run from repository root — the folder that contains `skills_extracti
             Path(args.ontology_only),
             output_dir=Path(args.output_dir),
             run_id=args.run_id.strip() or None,
+        )
+        return
+
+    if args.job_title_skills_only:
+        build_job_title_skills_from_file(
+            Path(args.job_title_skills_only),
+            output_dir=Path(args.output_dir),
+            run_id=args.run_id.strip() or None,
+            confidence_floor=args.confidence_floor,
+            title_norm_path=Path(args.title_norm) if args.title_norm else None,
         )
         return
 

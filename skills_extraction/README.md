@@ -163,6 +163,7 @@ python -m skills_extraction [OPTIONS]
 | `--no-hardsoft-classifier` | Disable hard/soft classifier pass. |
 | `--skip-llm` | Legacy/debug flag. The richest no-LLM structural output is still on the older `process_single_job()` path; the default stage-first pipeline is centered on stage-1 extraction. |
 | `--no-reports` | Skip derived quality/frequency/low-confidence reports. |
+| `--ontology-only PATH` | Skip pipeline; build ontology from an existing augmented JSON file. |
 | `--no-resume` | Ignore existing checkpoints; overwrite from scratch. |
 | `--resume-latest` | Reuse the most recent checkpointed run id in the output directory. |
 | `--rerun-from {stage1,stage2,stage3,stage4}` | Delete checkpoints from that stage onward before resuming. Use `stage2` to keep stage1 and rerun stages 2-4. |
@@ -229,9 +230,38 @@ python Runskills_extraction.py -i SampleJobs.json -o ./out --sample 10
 4. **Stage 3 requirement** — Classify accepted mentions as `required|optional|unclear`. **Authoritative** — overrides extractor `requirement_level`.
 5. **Stage 4 hard/soft** — Classify accepted mentions as `hard|soft|unknown`. **Authoritative** — overrides extractor `hard_soft`.
 6. **Stage 5 assemble** — Merge per-stage outputs into final mention rows plus job-level audit metadata. Extractor classifications preserved in audit trail.
-7. **Export** — Augmented JSON, JSONL, CSV, optional reports, and `run_summary.json`.
+7. **Stage 6 ontology** — Pure aggregation (no LLM). Groups verified mentions by normalized canonical name, computes frequency/confidence/distribution stats, and writes ontology JSON + CSV.
+8. **Export** — Augmented JSON, JSONL, CSV, ontology, optional reports, and `run_summary.json`.
 
 **Legacy path still in code:** preprocessing, sectioning, boilerplate labeling, quality scoring, and candidate mining remain implemented and are still exercised by `process_single_job()`, but stage 0 is currently disabled in the default stage-first orchestration.
+
+### Running individual stages
+
+**Rerun from a specific stage** (keep earlier checkpoints):
+
+```bash
+# Reuse stage 1, rerun stages 2-4 (5-6 run automatically after)
+python -m skills_extraction -i jobs.json -o ./out --run-id YOUR_RUN_ID --rerun-from stage2
+
+# Retry only stage 1 failures before running downstream stages
+python -m skills_extraction -i jobs.json -o ./out --run-id YOUR_RUN_ID --retry-stage1-errors
+```
+
+**Skip LLM stages selectively:**
+
+```bash
+# Extraction only — skip verification and classification
+python -m skills_extraction -i jobs.json -o ./out \
+  --no-verifier --no-requirement-classifier --no-hardsoft-classifier
+```
+
+**Build ontology standalone** (stage 6 only, no LLM needed):
+
+```bash
+python -m skills_extraction --ontology-only path/to/SkillsExtraction_augmented_run_RUNID.json -o ./out
+```
+
+This reads an existing augmented JSON file and produces only the ontology JSON and CSV outputs.
 
 ---
 
@@ -244,13 +274,37 @@ Written under `--output-dir`:
 | `SkillsExtraction_augmented_run_{run_id}.json` | Full jobs with appended fields (see below). |
 | `SkillsExtraction_mentions_run_{run_id}.jsonl` | One JSON object per mention (long format). |
 | `SkillsExtraction_mentions_run_{run_id}.csv` | Same as JSONL, tabular. |
+| `SkillsExtraction_ontology_run_{run_id}.json` | Skills ontology — canonical skills with variants, stats, distributions. |
+| `SkillsExtraction_ontology_run_{run_id}.csv` | Same ontology, tabular. |
 | `SkillsExtraction_pipeline_run_{run_id}.log` | Pipeline log. |
 | `SkillsExtraction_quality_run_{run_id}.csv` | Unless `--no-reports`. |
 | `SkillsExtraction_skill_frequency_run_{run_id}.csv` | Unless `--no-reports`. |
 | `SkillsExtraction_low_confidence_run_{run_id}.json` | Unless `--no-reports` (includes `parse_failed`). |
 | `SkillsExtraction_run_summary_{run_id}.json` | Timing, models, job counts (CLI runs). |
 
-Under the current default stage-first flow, the mention exports and run summary are the primary artifacts. The augmented JSON now includes `description_normalized` and source-grounded mention offsets. Reports that depend on per-line structural metadata (parsed lines, candidates) are still thinner than in the legacy single-job path.
+Under the current default stage-first flow, the mention exports, ontology, and run summary are the primary artifacts. The augmented JSON now includes `description_normalized` and source-grounded mention offsets. Reports that depend on per-line structural metadata (parsed lines, candidates) are still thinner than in the legacy single-job path.
+
+### Ontology output (stage 6)
+
+The ontology aggregates all verified mentions into canonical skills. Each entry contains:
+
+| Field | Description |
+|-------|-------------|
+| `canonical_skill` | Display name (title-cased best variant) |
+| `canonical_key` | Normalized key (lowercased, suffixes stripped) |
+| `variants` | Alternate surface forms seen in job postings |
+| `type` | Majority hard/soft classification |
+| `type_distribution` | Count per type (`{"hard": N, "soft": M}`) |
+| `requirement_level` | Majority required/optional/unclear |
+| `requirement_distribution` | Count per level |
+| `job_count` | Number of distinct jobs mentioning this skill |
+| `mention_count` | Total mention occurrences |
+| `avg_confidence` | Mean final confidence across mentions |
+| `confidence_range` | `[min, max]` confidence |
+| `common_contexts` | Top 10 job titles where this skill appears |
+| `run_id` | Pipeline run identifier |
+
+Canonicalization strips trailing noise words (skills, proficiency, expertise, knowledge, experience, abilities) and normalizes whitespace/Unicode before grouping.
 
 ---
 
@@ -376,6 +430,7 @@ Thinking-mode suppression (`disable_thinking: True`, the default) sends `chat_te
 | `confidence.py` | Final confidence blending |
 | `checkpoint.py` | Checkpoint save/load, resume logic, serialization |
 | `exporters.py` | JSON / JSONL / CSV / reports |
+| `ontology.py` | Stage 6: canonical skill aggregation, ontology JSON/CSV export, standalone mode |
 | `pipeline.py` | Orchestration, rolling worker pool, incremental checkpointing |
 | `run_stats.py` | Run timing / LLM stats for logs and `run_summary` JSON |
 

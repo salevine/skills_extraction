@@ -43,7 +43,8 @@ from .exporters import (
     write_quality_report,
 )
 from .io_utils import augment_job_record, stable_job_key
-from .ontology import build_ontology, write_ontology_json, write_ontology_csv
+from .job_title_skills import build_job_title_skills, write_job_title_skills_json
+from .ontology import build_ontology, write_ontology_json, write_ontology_csv, find_potential_duplicates, write_duplicate_report
 from .llm_extractor import batch_lines, extract_mentions_for_batch, extract_mentions_for_job
 from .llm_hardsoft_classifier import classify_hard_soft
 from .llm_requirement_classifier import classify_requirement_level
@@ -2212,6 +2213,17 @@ def run_pipeline(
     paths["ontology_csv"] = output_dir / f"SkillsExtraction_ontology_run_{run_id}.csv"
     write_ontology_json(paths["ontology_json"], ontology)
     write_ontology_csv(paths["ontology_csv"], ontology)
+
+    duplicate_candidates = find_potential_duplicates(ontology, min_jobs=2)
+    paths["duplicates_json"] = output_dir / f"SkillsExtraction_duplicate_candidates_run_{run_id}.json"
+    write_duplicate_report(paths["duplicates_json"], duplicate_candidates)
+
+    # --- Stage 7: Job-title skill weights (no LLM) ---
+    stats.record_stage_start("stage7_job_title_skills")
+    jts_data = build_job_title_skills(augmented, run_id)
+    stats.record_stage_end("stage7_job_title_skills")
+    paths["job_title_skills_json"] = output_dir / f"SkillsExtraction_job_title_skills_run_{run_id}.json"
+    write_job_title_skills_json(paths["job_title_skills_json"], jts_data)
 
     if log_path:
         try:
