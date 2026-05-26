@@ -304,7 +304,8 @@ Examples (run from repository root — the folder that contains `skills_extracti
         if len(detail_safe) > max_detail:
             detail_safe = detail_safe[:max_detail - 1] + "…"
 
-        msg = f"  {bar} {pct:5.1f}% [{job_idx + 1:>{len(str(total))}}/{total}] ETA {eta:>8s}  {detail_safe}"
+        ts = dt.datetime.now().strftime("%H:%M:%S")
+        msg = f"  {ts}  {bar} {pct:5.1f}% [{job_idx + 1:>{len(str(total))}}/{total}] ETA {eta:>8s}  {detail_safe}"
         # Pad with spaces to overwrite previous longer lines
         try:
             print(f"\r{msg:<100}", end="", flush=True)
