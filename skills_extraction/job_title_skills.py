@@ -40,7 +40,17 @@ def load_title_normalization(path: Path) -> Dict[str, str]:
         import pandas as pd
     except ImportError:
         raise ImportError("pandas and openpyxl are required to load title normalization Excel files")
-    df = pd.read_excel(path, sheet_name="Job_Titles")
+    xls = pd.ExcelFile(path)
+    if "Job_Titles" in xls.sheet_names:
+        sheet = "Job_Titles"
+    else:
+        sheet = xls.sheet_names[0]
+        logger.info(
+            "Sheet 'Job_Titles' not found in %s; falling back to first sheet '%s'",
+            path,
+            sheet,
+        )
+    df = pd.read_excel(xls, sheet_name=sheet)
     mapping: Dict[str, str] = {}
     for _, row in df.iterrows():
         raw = row.get("Raw_title")
