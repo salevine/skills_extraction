@@ -93,6 +93,7 @@ Examples (run from repository root — the folder that contains `skills_extracti
     )
     parser.add_argument("--input", "-i", default=str(Path("../jobs/SampleJobs.json")), help="Input JSON (list of jobs or {jobs: [...]}); default: ../jobs/SampleJobs.json")
     parser.add_argument("--output-dir", "-o", default="skills_extraction_output", help="Directory for outputs")
+    parser.add_argument("--log-dir", default="", help="Directory for the pipeline run log (default: output dir)")
     parser.add_argument("--run-id", default="", help="Run id (default: timestamp YYYYMMDD_HHMMSS)")
     parser.add_argument("--local", action="store_true", help="Use Ollama at http://localhost:11434")
     parser.add_argument("--extractor-model", default="", help="Override extractor model tag (default: qwen2.5:14b or env)")
@@ -191,7 +192,8 @@ Examples (run from repository root — the folder that contains `skills_extracti
         ts = generate_run_id()
         run_id = f"{label}_{ts}" if label else ts
     out_dir = Path(args.output_dir)
-    log_file = out_dir / f"SkillsExtraction_pipeline_run_{run_id}.log"
+    log_dir = Path(args.log_dir) if args.log_dir else out_dir
+    log_file = log_dir / f"SkillsExtraction_pipeline_run_{run_id}.log"
     _configure_logging(log_file)
 
     overrides = {

@@ -180,6 +180,7 @@ cd "$BASE_DIR"
 
 INPUT="$INPUT"
 OUTPUT_DIR="$OUTPUT_DIR"
+LOG_DIR="$LOG_DIR"
 RUN_ID="$RUN_ID"
 ENDPOINTS="$ENDPOINTS"
 BASE_PORT="$BASE_PORT"
@@ -231,6 +232,7 @@ else
     conda run --no-capture-output -n skills python -m skills_extraction \\
       --input "\$INPUT" \\
       --output-dir "\$OUTPUT_DIR" \\
+      --log-dir "\$LOG_DIR" \\
       --run-id "\$RUN_ID" \\
       \$SAMPLE_FLAG \\
       \$EXTRA_FLAGS \\
@@ -279,6 +281,7 @@ echo "=== Stages 2-4: Verify + Classify (\$VERIFIER) — resuming \$RUN_ID ==="
 conda run --no-capture-output -n skills python -m skills_extraction \\
   --input "\$INPUT" \\
   --output-dir "\$OUTPUT_DIR" \\
+  --log-dir "\$LOG_DIR" \\
   --run-id "\$RUN_ID" \\
   --vllm \\
   --vllm-host localhost \\

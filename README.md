@@ -47,7 +47,8 @@ survives disconnect. It prompts for:
   `../data_files` (pick by number, or choose "Enter a custom path"), plus
   **sample size**
 - **Output directory** for result files + checkpoints (default `../data_files`)
-- **Log directory** for the run log and generated runner script (default `./logs`)
+- **Log directory** for the nohup run log, the generated runner script, and the
+  pipeline's own internal log (passed through as `--log-dir`); default `./logs`
 - **Run id** — new (timestamped) or resume an existing one (with optional
   `--rerun-from <stage>` or `--retry-stage1-errors`)
 - **Endpoints / base port** and the **extractor / verifier model** names
