@@ -48,6 +48,7 @@ rsync -avz \
   --exclude 'skills_extraction_output' \
   --exclude '_skills_test_out' \
   --exclude '*.log' \
+  --exclude '*.xlsx' \
   /Users/stacey/Documents/GitHub/skills_extraction/ \
   "$SERVER":~/skills_extraction/
 
