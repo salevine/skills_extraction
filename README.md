@@ -37,6 +37,20 @@ python -m skills_extraction -i your_jobs.json -o ./out --sample 5
 python -m skills_extraction -i jobs.json -o ./out --vllm
 ```
 
+### Interactive launcher (titan3)
+
+`launch.sh` prompts for input file, sample size, run-id (new or resume),
+endpoints/ports, and model names, then runs the full two-phase pipeline
+(Qwen extraction → swap to Mistral-Nemo for verify/classify) under `nohup`:
+
+```bash
+~/startQwen 8        # load extraction model first
+./launch.sh          # answer prompts, confirm, then it launches in the background
+```
+
+On resume it skips extraction if stage 1 is already complete. The run is
+logged to `run_<id>_<ts>.log`; check progress with `./check_status.sh <id>`.
+
 ### Rerun from a specific stage (keep earlier results)
 
 ```bash
@@ -116,6 +130,7 @@ The ontology JSON is an array of canonical skill entries:
 | `Runskills_extraction.py` | Optional launcher shim (same as `python -m skills_extraction`) |
 | `requirements.txt` | Runtime dependencies |
 | `deploy.sh` | Rsync code to vLLM server (`-s` to include sample data) |
+| `launch.sh` | Interactive launcher (titan3): prompts for settings, runs two-phase pipeline under `nohup` |
 | `vLLM_run.sh` | Server-side run script (conda + vLLM config) |
 | `test_vllm.sh` | Curl-based endpoint health check |
 
