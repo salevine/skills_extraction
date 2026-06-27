@@ -6,8 +6,10 @@
 set -euo pipefail
 
 BASE_DIR="$HOME/skills_extraction"
-CHECKPOINT_DIR="$BASE_DIR/out/checkpoints"
-OUT_DIR="$BASE_DIR/out"
+# Output location is overridable so status works when results live elsewhere
+# (e.g. ../data_files). Defaults to the repo's ./out for backward compatibility.
+OUT_DIR="${SKILLS_OUT_DIR:-$BASE_DIR/out}"
+CHECKPOINT_DIR="$OUT_DIR/checkpoints"
 FILTER_RUN="${1:-}"
 
 if [ ! -d "$CHECKPOINT_DIR" ]; then

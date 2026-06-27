@@ -12,12 +12,12 @@
 set -euo pipefail
 
 BASE_DIR="$HOME/skills_extraction"
-OUT_DIR="$BASE_DIR/out"
-CHECKPOINT_DIR="$OUT_DIR/checkpoints"
-LAUNCH_DIR="$OUT_DIR/launch_runs"
 
-# Defaults
-DEF_INPUT="../jobs/SampleJobs.json"
+# Defaults — input file, output dir, and log dir are independently located so
+# different programs can own different locations.
+DEF_INPUT="../data_files/SampleJobs.json"
+DEF_OUTPUT="../data_files"
+DEF_LOGS="./logs"
 DEF_SAMPLE="0"
 DEF_ENDPOINTS="8"
 DEF_BASE_PORT="8000"
@@ -25,7 +25,6 @@ DEF_EXTRACTOR="Qwen/Qwen3-14B"
 DEF_VERIFIER="mistralai/Mistral-Nemo-Instruct-2407"
 
 cd "$BASE_DIR"
-mkdir -p "$LAUNCH_DIR"
 
 echo "=========================================="
 echo "  Skills Extraction — Interactive Launcher"
@@ -45,6 +44,19 @@ done
 # --- ask: sample size ---
 read -r -p "Sample size, 0 = all jobs [$DEF_SAMPLE]: " SAMPLE
 SAMPLE="${SAMPLE:-$DEF_SAMPLE}"
+
+# --- ask: output directory (result files; checkpoints live here too) ---
+read -r -p "Output directory for result files [$DEF_OUTPUT]: " OUTPUT_DIR
+OUTPUT_DIR="${OUTPUT_DIR:-$DEF_OUTPUT}"
+mkdir -p "$OUTPUT_DIR"
+OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"   # resolve to absolute
+RUN_CKPT_DIR="$OUTPUT_DIR/checkpoints"
+
+# --- ask: log directory (run log + generated runner script; separate from data) ---
+read -r -p "Log directory (run log + runner script) [$DEF_LOGS]: " LOG_DIR
+LOG_DIR="${LOG_DIR:-$DEF_LOGS}"
+mkdir -p "$LOG_DIR"
+LOG_DIR="$(cd "$LOG_DIR" && pwd)"   # resolve to absolute
 
 # --- ask: new run or resume ---
 RERUN_FROM=""
@@ -95,8 +107,8 @@ PORTS=$(seq "$BASE_PORT" "$LAST_PORT")
 
 # --- summary ---
 TS="$(date +%Y%m%d_%H%M%S)"
-RUNNER="$LAUNCH_DIR/run_${RUN_ID}.sh"
-LOGFILE="$BASE_DIR/run_${RUN_ID}_${TS}.log"
+RUNNER="$LOG_DIR/run_${RUN_ID}.sh"
+LOGFILE="$LOG_DIR/run_${RUN_ID}_${TS}.log"
 
 echo ""
 echo "=========================================="
@@ -115,7 +127,8 @@ fi
 echo "  Endpoints         : $ENDPOINTS  (ports $BASE_PORT-$LAST_PORT)"
 echo "  Extractor model   : $EXTRACTOR"
 echo "  Verify/classify   : $VERIFIER"
-echo "  Output dir        : ./out"
+echo "  Output dir        : $OUTPUT_DIR"
+echo "  Log dir           : $LOG_DIR"
 echo "  Runner script     : $RUNNER"
 echo "  Log file          : $LOGFILE"
 echo ""
@@ -141,6 +154,7 @@ set -euo pipefail
 cd "$BASE_DIR"
 
 INPUT="$INPUT"
+OUTPUT_DIR="$OUTPUT_DIR"
 RUN_ID="$RUN_ID"
 ENDPOINTS="$ENDPOINTS"
 BASE_PORT="$BASE_PORT"
@@ -149,7 +163,7 @@ VERIFIER="$VERIFIER"
 PORTS="$PORTS"
 EXTRA_FLAGS="$EXTRA_FLAGS"
 SAMPLE_FLAG="$SAMPLE_FLAG"
-STAGE1_CKPT="$CHECKPOINT_DIR/\${RUN_ID}_stage1_extracted.jsonl"
+STAGE1_CKPT="$RUN_CKPT_DIR/\${RUN_ID}_stage1_extracted.jsonl"
 
 echo "=== Skills extraction run \$RUN_ID — \$(date) ==="
 
@@ -191,7 +205,7 @@ else
     echo "=== Stages 0-1: Extraction (\$EXTRACTOR) ==="
     conda run --no-capture-output -n skills python -m skills_extraction \\
       --input "\$INPUT" \\
-      --output-dir ./out \\
+      --output-dir "\$OUTPUT_DIR" \\
       --run-id "\$RUN_ID" \\
       \$SAMPLE_FLAG \\
       \$EXTRA_FLAGS \\
@@ -239,7 +253,7 @@ echo ""
 echo "=== Stages 2-4: Verify + Classify (\$VERIFIER) — resuming \$RUN_ID ==="
 conda run --no-capture-output -n skills python -m skills_extraction \\
   --input "\$INPUT" \\
-  --output-dir ./out \\
+  --output-dir "\$OUTPUT_DIR" \\
   --run-id "\$RUN_ID" \\
   --vllm \\
   --vllm-host localhost \\
@@ -252,7 +266,7 @@ conda run --no-capture-output -n skills python -m skills_extraction \\
 
 echo ""
 echo "=== Pipeline complete — \$(date) — run \$RUN_ID ==="
-./check_status.sh "\$RUN_ID" 2>/dev/null || true
+SKILLS_OUT_DIR="\$OUTPUT_DIR" ./check_status.sh "\$RUN_ID" 2>/dev/null || true
 RUNNER_EOF
 
 chmod +x "$RUNNER"
