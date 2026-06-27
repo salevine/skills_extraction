@@ -16,6 +16,7 @@ BASE_DIR="$HOME/skills_extraction"
 # Defaults — input file, output dir, and log dir are independently located so
 # different programs can own different locations.
 DEF_INPUT="../data_files/SampleJobs.json"
+DEF_INPUT_DIR="../data_files"
 DEF_OUTPUT="../data_files"
 DEF_LOGS="./logs"
 DEF_SAMPLE="0"
@@ -31,15 +32,39 @@ echo "  Skills Extraction — Interactive Launcher"
 echo "=========================================="
 echo ""
 
-# --- ask: input file (must exist) ---
-while true; do
-    read -r -p "Input JSON file [$DEF_INPUT]: " INPUT
-    INPUT="${INPUT:-$DEF_INPUT}"
-    if [ -f "$INPUT" ]; then
-        break
-    fi
-    echo "  ! File not found: $INPUT  (try again)"
-done
+# --- ask: input file (scrollable picker over .json files in the data dir) ---
+shopt -s nullglob
+json_files=( "$DEF_INPUT_DIR"/*.json )
+shopt -u nullglob
+
+if [ ${#json_files[@]} -gt 0 ]; then
+    echo "Input JSON file — choose from $DEF_INPUT_DIR:"
+    PS3="Select input file number: "
+    select choice in "${json_files[@]}" "Enter a custom path"; do
+        if [ -z "$choice" ]; then
+            echo "  ! invalid selection (enter a listed number)"
+            continue
+        fi
+        if [ "$choice" = "Enter a custom path" ]; then
+            read -r -p "  Path to input JSON: " INPUT
+        else
+            INPUT="$choice"
+        fi
+        if [ -f "$INPUT" ]; then
+            break
+        fi
+        echo "  ! file not found: $INPUT"
+    done
+else
+    echo "  (no .json files found in $DEF_INPUT_DIR)"
+    while true; do
+        read -r -p "Path to input JSON [$DEF_INPUT]: " INPUT
+        INPUT="${INPUT:-$DEF_INPUT}"
+        [ -f "$INPUT" ] && break
+        echo "  ! file not found: $INPUT"
+    done
+fi
+echo "  -> using: $INPUT"
 
 # --- ask: sample size ---
 read -r -p "Sample size, 0 = all jobs [$DEF_SAMPLE]: " SAMPLE

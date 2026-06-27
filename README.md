@@ -43,7 +43,9 @@ python -m skills_extraction -i jobs.json -o ./out --vllm
 (Qwen extraction → swap to Mistral-Nemo for verify/classify) under `nohup` so it
 survives disconnect. It prompts for:
 
-- **Input file** (default `../data_files/SampleJobs.json`) and **sample size**
+- **Input file** — a scrollable numbered menu of the `.json` files in
+  `../data_files` (pick by number, or choose "Enter a custom path"), plus
+  **sample size**
 - **Output directory** for result files + checkpoints (default `../data_files`)
 - **Log directory** for the run log and generated runner script (default `./logs`)
 - **Run id** — new (timestamped) or resume an existing one (with optional
