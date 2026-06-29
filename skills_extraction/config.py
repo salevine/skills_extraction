@@ -82,7 +82,11 @@ class PipelineConfig:
     quality_complete_min_score: float = 0.45
 
     # Pipeline
-    pipeline_version: str = "3.4.1"
+    # 3.5.0: extract_description_fields now prefers the scraped ad (description_raw)
+    # over O*NET-sourced job_description. Bumped so stage fingerprints change and any
+    # resume of a pre-3.5.0 (O*NET-based) run-id auto-invalidates instead of silently
+    # reusing stale stage-1 output with mismatched offsets.
+    pipeline_version: str = "3.5.0"
     skip_llm: bool = False  # for tests: candidates only
     disable_thinking: bool = True  # append /no_think to suppress qwen3 thinking mode
     checkpoint_flush_interval: int = 16  # flush checkpoint every N records (1=every record)

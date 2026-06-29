@@ -5,9 +5,12 @@ Offsets for parsed structures are relative to `description_normalized`.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from typing import Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -57,10 +60,19 @@ def extract_description_fields(job: dict) -> Tuple[str, str]:
             title = v.strip()
             break
     desc = ""
+    # `job_description` (snake_case) is DEMOTED to last resort. In some exports
+    # (e.g. cs_jobs_export, where job_description_source == "onet") that field holds a
+    # standardized O*NET occupational task statement, not the real ad: ~380 chars,
+    # shared across many jobs, almost no soft-skill language. Extracting from it
+    # produced a ~99.7% "hard" skew (run launch_20260627_114046). The scraped ad lives
+    # in `description_raw`, so it is tried ahead of `job_description`.
+    # The camelCase `JobDescription`/`jobDescription` stay first: in other datasets
+    # those carry the real posting and have not shown the O*NET contamination — only
+    # the snake_case key is known to be poisoned. Order is load-bearing; do not re-sort
+    # (see test_description_priority).
     for k in (
         "JobDescription",
         "jobDescription",
-        "job_description",
         "description_raw",
         "Description",
         "description",
@@ -68,10 +80,20 @@ def extract_description_fields(job: dict) -> Tuple[str, str]:
         "jobDesc",
         "posting",
         "jobPosting",
+        "job_description",
     ):
         v = job.get(k)
         if isinstance(v, str) and v.strip():
             desc = v.strip()
+            if k == "job_description":
+                # Reached only when no scraped/real-ad field was present. On datasets
+                # like cs_jobs_export this means falling back to O*NET text, which
+                # reproduces the hard-skew bug — make that observable.
+                logger.warning(
+                    "extract_description_fields fell back to 'job_description' "
+                    "(may be O*NET-sourced, not the real posting) for job id=%s",
+                    job.get("id"),
+                )
             break
     # Do not substitute company/location as pseudo-description (distorts quality & extraction).
     return title, desc

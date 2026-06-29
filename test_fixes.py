@@ -1187,11 +1187,47 @@ def test_retry_failed_stage1_records_repairs_checkpoint():
 
 
 # ---------------------------------------------------------------------------
+# Test: description field priority — description_raw must win over O*NET
+#       job_description (guards the cs_jobs_export hard-skew regression).
+# ---------------------------------------------------------------------------
+
+def test_description_priority():
+    from skills_extraction.preprocessing import extract_description_fields
+
+    # Both present -> the real scraped ad (description_raw) wins, NOT job_description.
+    _, desc = extract_description_fields(
+        {"description_raw": "REAL AD", "job_description": "ONET TASK STATEMENT"}
+    )
+    assert desc == "REAL AD", desc
+
+    # Only job_description -> falls back to it (matches the 1 empty-raw real record).
+    _, desc = extract_description_fields({"job_description": "ONET TASK STATEMENT"})
+    assert desc == "ONET TASK STATEMENT", desc
+
+    # Empty/whitespace description_raw -> falls back.
+    _, desc = extract_description_fields(
+        {"description_raw": "   ", "job_description": "ONET"}
+    )
+    assert desc == "ONET", desc
+
+    # Non-string description_raw -> falls back.
+    _, desc = extract_description_fields(
+        {"description_raw": 123, "job_description": "ONET"}
+    )
+    assert desc == "ONET", desc
+
+    # Missing both -> empty.
+    _, desc = extract_description_fields({"title_raw": "Engineer"})
+    assert desc == "", desc
+
+
+# ---------------------------------------------------------------------------
 # Run all
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     all_tests = [
+        ("test_description_priority", test_description_priority),
         ("test_stage5_authority", test_stage5_authority),
         ("test_stage5_classifier_authority", test_stage5_classifier_authority),
         ("test_repeated_span_grounding", test_repeated_span_grounding),
