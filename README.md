@@ -138,6 +138,22 @@ The ontology JSON is an array of canonical skill entries:
 ]
 ```
 
+## Performance
+
+Full-corpus production runs (8× NVIDIA RTX A6000, vLLM, thinking disabled).
+Extractor is Qwen3-14B; verify/classify stages use Mistral-Nemo-Instruct-2407.
+
+| Jobs | Mentions | Extract (s1) | Verify (s2) | Requirement (s3) | Hard/Soft (s4) | Pipeline wall | Version |
+|------|----------|--------------|-------------|------------------|----------------|---------------|---------|
+| 18,956 | 122,987 | 12h41m | 6h40m | 7h16m | 6h41m | 33h18m | v3.4.1 |
+
+Run `launch_20260627_114046` details:
+
+- **387,263 LLM calls**, ~265 GPU compute-hours; 100% job success (0 failed), 6.49 mentions/job.
+- **Per-call cost drives the split:** extraction is 19.1 s/call (one whole-job call per job, 18,956 calls); verify/classify are 1.61 s/call (~3 calls per mention, 368,307 calls). Extraction is ~38% of wall time on ~5% of the calls.
+- **GPU saturation was near-perfect:** 7.92× parallelism during extraction and 8.00× during verify/classify — effectively no idle endpoints.
+- "Pipeline wall" is the sum of stage times (33h18m of processing); calendar span was longer because the two phases ran ~10h apart.
+
 ## Documentation
 
 - **Full guide, CLI reference, data model:** [`skills_extraction/README.md`](skills_extraction/README.md)
