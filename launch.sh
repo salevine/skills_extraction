@@ -8,7 +8,10 @@
 # Usage:
 #   ./launch.sh
 #
-# Servers are assumed already running. Start Qwen first:  ~/startQwen 8
+# The run starts/swaps the vLLM models itself: it loads Qwen for extraction
+# (Phase 1) and swaps to Mistral-Nemo for verify/classify (Phase 2), using the
+# ~/startQwen, ~/startMistral, and ~/stopModel helpers — so those must exist on
+# the host. No need to start a model by hand first.
 set -euo pipefail
 
 BASE_DIR="$HOME/skills_extraction"
@@ -218,13 +221,32 @@ if stage1_done; then
     echo "=== Stage 1 already complete for \$RUN_ID — skipping extraction phase ==="
 else
     echo ""
-    echo "=== Phase 1: verifying Qwen endpoints ==="
+    echo "=== Phase 1: ensuring Qwen is loaded for extraction ==="
+    MODEL=\$(loaded_model)
+    case "\$MODEL" in
+        *[Qq]wen*) echo "Qwen already loaded: \$MODEL" ;;
+        *)
+            echo "Loading \$EXTRACTOR ..."
+            ~/stopModel || true
+            sleep 10
+            ~/startQwen "\$ENDPOINTS"
+            ;;
+    esac
+
+    echo "Waiting for \$EXTRACTOR to load..."
+    for i in \$(seq 1 60); do
+        if curl -s "http://localhost:\${BASE_PORT}/v1/models" > /dev/null 2>&1; then
+            echo "Ready after \${i}0 seconds"
+            break
+        fi
+        sleep 10
+    done
     verify_endpoints
     MODEL=\$(loaded_model)
     echo "Model on port \$BASE_PORT: \$MODEL"
     case "\$MODEL" in
         *[Qq]wen*) : ;;
-        *) echo "ERROR: expected Qwen on the endpoints for extraction; found '\$MODEL'. Start it: ~/startQwen \$ENDPOINTS"; exit 1 ;;
+        *) echo "ERROR: expected Qwen after startup; found '\$MODEL'. Check ~/startQwen."; exit 1 ;;
     esac
 
     echo ""
