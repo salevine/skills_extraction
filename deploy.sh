@@ -47,6 +47,7 @@ rsync -avz \
   --exclude 'out/' \
   --exclude 'skills_extraction_output' \
   --exclude '_skills_test_out' \
+  --exclude 'logs/' \
   --exclude '*.log' \
   --exclude '*.xlsx' \
   /Users/stacey/Documents/GitHub/skills_extraction/ \
