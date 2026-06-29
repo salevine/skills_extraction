@@ -16,10 +16,8 @@ rsync -avz \
   --exclude '.DS_Store' \
   --exclude '.claude/' \
   --exclude '.gitnexus/' \
-  --exclude 'CLAUDE.md' \
-  --exclude 'AGENTS.md' \
-  --exclude 'README.md' \
-  --exclude 'skills_extraction/README.md' \
+  --include '/README.md' \
+  --exclude '*.md' \
   --exclude '.gitignore' \
   --exclude '.github' \
   --exclude 'test_payload.py' \
@@ -37,12 +35,7 @@ rsync -avz \
   --exclude 'prompts_updated.py' \
   --exclude 'Runskills_extraction.py' \
   --exclude 'script_part1.b64' \
-  --exclude 'CHAPTER_*' \
-  --exclude 'NOTES_*' \
-  --exclude 'FUTURE_*' \
   --exclude 'full_run_output' \
-  --exclude 'skills_extraction/CHANGELOG.md' \
-  --exclude 'skills_extraction/README.md' \
   --exclude 'skills_extraction/prompts_backup_*' \
   --exclude 'out/' \
   --exclude 'skills_extraction_output' \
